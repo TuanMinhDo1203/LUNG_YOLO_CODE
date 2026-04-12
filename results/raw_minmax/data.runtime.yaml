@@ -1,0 +1,27 @@
+path: /home/Ubuntu/LUNG_YOLO/yolo_preprocess_runner/extracted/raw_minmax
+train: /home/Ubuntu/LUNG_YOLO/yolo_preprocess_runner/extracted/raw_minmax/train.runtime.txt
+val: /home/Ubuntu/LUNG_YOLO/yolo_preprocess_runner/extracted/raw_minmax/val.runtime.txt
+names:
+  0: Aortic enlargement
+  1: Atelectasis
+  2: Calcification
+  3: Cardiomegaly
+  4: Clavicle fracture
+  5: Consolidation
+  6: Edema
+  7: Emphysema
+  8: Enlarged PA
+  9: ILD
+  10: Infiltration
+  11: Lung Opacity
+  12: Lung cavity
+  13: Lung cyst
+  14: Mediastinal shift
+  15: Nodule/Mass
+  16: Other lesion
+  17: Pleural effusion
+  18: Pleural thickening
+  19: Pneumothorax
+  20: Pulmonary fibrosis
+  21: Rib fracture
+test: /home/Ubuntu/LUNG_YOLO/yolo_preprocess_runner/extracted/raw_minmax/test.runtime.txt
