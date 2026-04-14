@@ -51,6 +51,8 @@ PREPROCESS_JOBS = [
     {"name": "raw_minmax", "remote_subdir": "vinbigdata-raw_minmax-png"},
     {"name": "rescale_minmax", "remote_subdir": "vinbigdata-rescale_minmax-png"},
     {"name": "base_dataset", "remote_subdir": "vindr_yolo_dataset"},
+    {"name": "LUT", "remote_subdir": "vinbigdata-lut-png"},
+    {"name": "expert_window", "remote_subdir": "vinbigdata-expert-png"},
 ]
 
 # local workspace

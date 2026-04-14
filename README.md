@@ -54,6 +54,8 @@ Mặc định [train.py](/home/bendo/Desktop/Ben/Research/Lung/train.py) loop qu
 - `vinbigdata-percentile-png`
 - `vinbigdata-raw_minmax-png`
 - `vinbigdata-rescale_minmax-png`
+- `vinbigdata-lut-png`
+- `vinbigdata-expert-png`
 - `vindr_yolo_dataset`
 
 Tên job local tương ứng:
@@ -64,6 +66,8 @@ Tên job local tương ứng:
 - `percentile`
 - `raw_minmax`
 - `rescale_minmax`
+- `lut`
+- `expert-window`
 - `base_dataset`
 
 Remote base mặc định:
