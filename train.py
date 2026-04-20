@@ -20,7 +20,7 @@ from ultralytics import YOLO
 DEVICE = 0 if torch.cuda.is_available() else "cpu"
 MODEL_NAME = "yolov8n.pt"
 EPOCHS = 50
-IMG_SIZE = 1024
+IMG_SIZE = 512
 BATCH = 8
 WORKERS = 4
 
@@ -38,6 +38,34 @@ QUICK_CHECK_BATCH = int(os.environ.get("YOLO_QUICK_CHECK_BATCH", "4"))
 FORCE_RECOPY = os.environ.get("YOLO_FORCE_RECOPY", "0") == "1"
 FORCE_REUNPACK = os.environ.get("YOLO_FORCE_REUNPACK", "0") == "1"
 KEEP_STAGE = os.environ.get("YOLO_KEEP_STAGE", "0") == "1"
+CLASS_MODE = os.environ.get("YOLO_CLASS_MODE", "22").strip()
+
+OFFICIAL_14_CLASS_NAMES = [
+    "Aortic enlargement",
+    "Atelectasis",
+    "Calcification",
+    "Cardiomegaly",
+    "Consolidation",
+    "ILD",
+    "Infiltration",
+    "Lung Opacity",
+    "Nodule/Mass",
+    "Other lesion",
+    "Pleural effusion",
+    "Pleural thickening",
+    "Pneumothorax",
+    "Pulmonary fibrosis",
+]
+DROP_8_CLASS_NAMES = [
+    "Clavicle fracture",
+    "Edema",
+    "Emphysema",
+    "Enlarged PA",
+    "Lung cavity",
+    "Lung cyst",
+    "Mediastinal shift",
+    "Rib fracture",
+]
 
 # remote gốc trên rclone
 REMOTE_BASE = os.environ.get("RCLONE_REMOTE_BASE", "rclone:")
@@ -75,6 +103,7 @@ print("QUICK_CHECK_MODE:", QUICK_CHECK_MODE)
 print("FORCE_RECOPY:", FORCE_RECOPY)
 print("FORCE_REUNPACK:", FORCE_REUNPACK)
 print("KEEP_STAGE:", KEEP_STAGE)
+print("CLASS_MODE:", CLASS_MODE)
 
 
 # =========================
@@ -96,6 +125,15 @@ def ensure_command_exists(command_name: str):
 def safe_rmtree(path: Path):
     if path.exists():
         shutil.rmtree(path, ignore_errors=True)
+
+
+def safe_remove(path: Path):
+    if not path.exists() and not path.is_symlink():
+        return
+    if path.is_symlink() or path.is_file():
+        path.unlink(missing_ok=True)
+        return
+    shutil.rmtree(path, ignore_errors=True)
 
 
 def clear_local_stage():
@@ -323,8 +361,99 @@ def maybe_limit_files(files, limit: int):
     return files[:limit]
 
 
+def validate_class_mode():
+    if CLASS_MODE not in {"22", "14"}:
+        raise ValueError(
+            f"YOLO_CLASS_MODE phải là '22' hoặc '14', nhưng đang là: {CLASS_MODE}"
+        )
+
+
 def sanitize_class_name(name: str):
     return str(name).strip()
+
+
+def normalize_names_field(names):
+    if isinstance(names, dict):
+        return [name for _, name in sorted(((int(k), v) for k, v in names.items()), key=lambda x: x[0])]
+    if isinstance(names, list):
+        return list(names)
+    raise ValueError(f"names field không hợp lệ: {type(names)}")
+
+
+def build_names_dict(class_names):
+    return {i: name for i, name in enumerate(class_names)}
+
+
+def should_use_14class_mode():
+    return CLASS_MODE == "14"
+
+
+def ensure_runtime_symlink(src: Path, dst: Path):
+    safe_remove(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.symlink_to(src, target_is_directory=True)
+
+
+def get_14class_idx_map_from_names(class_names):
+    keep_set = set(OFFICIAL_14_CLASS_NAMES)
+    target_name_to_idx = {name: idx for idx, name in enumerate(OFFICIAL_14_CLASS_NAMES)}
+    return {
+        src_idx: target_name_to_idx[name]
+        for src_idx, name in enumerate(class_names)
+        if name in keep_set
+    }
+
+
+def filter_yolo_label_file(src: Path, dst: Path, idx_map: dict):
+    kept_lines = []
+    if src.exists():
+        for raw_line in src.read_text().splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) != 5:
+                continue
+            cls_idx = int(float(parts[0]))
+            if cls_idx not in idx_map:
+                continue
+            parts[0] = str(idx_map[cls_idx])
+            kept_lines.append(" ".join(parts))
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.write_text("\n".join(kept_lines) + ("\n" if kept_lines else ""))
+
+
+def build_yolo_14class_dataset(source_root: Path, source_yaml: Path):
+    with open(source_yaml, "r") as f:
+        data_cfg = yaml.safe_load(f)
+
+    class_names = normalize_names_field(data_cfg["names"])
+    idx_map = get_14class_idx_map_from_names(class_names)
+    runtime_root = source_root / ".yolo_runtime_14class"
+    safe_remove(runtime_root)
+    runtime_root.mkdir(parents=True, exist_ok=True)
+
+    ensure_runtime_symlink(source_root / "images", runtime_root / "images")
+
+    src_labels_root = source_root / "labels"
+    dst_labels_root = runtime_root / "labels"
+    for src_label in sorted(src_labels_root.rglob("*.txt")):
+        rel = src_label.relative_to(src_labels_root)
+        filter_yolo_label_file(src_label, dst_labels_root / rel, idx_map)
+
+    runtime_yaml = runtime_root / "data.yaml"
+    runtime_cfg = {
+        "path": str(runtime_root),
+        "train": "images/train",
+        "val": "images/val",
+        "names": build_names_dict(OFFICIAL_14_CLASS_NAMES),
+    }
+    with open(runtime_yaml, "w") as f:
+        yaml.safe_dump(runtime_cfg, f, sort_keys=False)
+
+    print("Built 14-class YOLO runtime dataset:", runtime_root)
+    print("Dropped classes:", DROP_8_CLASS_NAMES)
+    return runtime_root, runtime_yaml
 
 
 def coco_bbox_to_yolo_line(bbox, img_w, img_h, cls_idx: int):
@@ -363,6 +492,28 @@ def collect_coco_categories(annotation_paths):
     class_names = [name for _, name in sorted_items]
     cat_id_to_class_idx = {cat_id: idx for idx, (cat_id, _) in enumerate(sorted_items)}
     return class_names, cat_id_to_class_idx
+
+
+def collect_coco_categories_14class(annotation_paths):
+    categories = {}
+    keep_set = set(OFFICIAL_14_CLASS_NAMES)
+    for ann_path in annotation_paths:
+        if not ann_path.exists():
+            continue
+        with open(ann_path, "r") as f:
+            data = json.load(f)
+        for cat in data.get("categories", []):
+            name = sanitize_class_name(cat["name"])
+            if name in keep_set:
+                categories[int(cat["id"])] = name
+    if not categories:
+        raise ValueError("Không tìm thấy categories 14-class trong COCO annotations")
+    target_name_to_idx = {name: idx for idx, name in enumerate(OFFICIAL_14_CLASS_NAMES)}
+    cat_id_to_class_idx = {
+        cat_id: target_name_to_idx[name]
+        for cat_id, name in categories.items()
+    }
+    return list(OFFICIAL_14_CLASS_NAMES), cat_id_to_class_idx
 
 
 def convert_coco_split_to_yolo(annotation_path: Path, image_dir: Path, label_dir: Path, cat_id_to_class_idx: dict):
@@ -450,8 +601,64 @@ def ensure_yolo_dataset(dataset_root: Path):
     images_dir = dataset_root / "images"
     annotations_dir = dataset_root / "annotations"
 
+    if should_use_14class_mode():
+        if data_yaml.exists() and labels_dir.exists():
+            return build_yolo_14class_dataset(dataset_root, data_yaml)
+
+        if not images_dir.exists() or not annotations_dir.exists():
+            raise FileNotFoundError(
+                f"Dataset ở {dataset_root} không có đủ data.yaml/labels hoặc images/annotations để convert"
+            )
+
+        train_ann = annotations_dir / "instances_train.json"
+        val_ann = annotations_dir / "instances_val.json"
+        if not train_ann.exists() or not val_ann.exists():
+            raise FileNotFoundError(
+                f"Thiếu COCO annotations trong {annotations_dir}. Cần instances_train.json và instances_val.json"
+            )
+
+        class_names, cat_id_to_class_idx = collect_coco_categories_14class([train_ann, val_ann])
+        runtime_root = dataset_root / ".yolo_runtime_14class"
+        safe_remove(runtime_root)
+        runtime_root.mkdir(parents=True, exist_ok=True)
+        ensure_runtime_symlink(images_dir, runtime_root / "images")
+        runtime_labels_dir = runtime_root / "labels"
+        (runtime_labels_dir / "train").mkdir(parents=True, exist_ok=True)
+        (runtime_labels_dir / "val").mkdir(parents=True, exist_ok=True)
+
+        print("Converting COCO dataset to 14-class YOLO format:", dataset_root)
+        print("Kept classes:", class_names)
+
+        train_stats = convert_coco_split_to_yolo(
+            annotation_path=train_ann,
+            image_dir=runtime_root / "images" / "train",
+            label_dir=runtime_labels_dir / "train",
+            cat_id_to_class_idx=cat_id_to_class_idx,
+        )
+        val_stats = convert_coco_split_to_yolo(
+            annotation_path=val_ann,
+            image_dir=runtime_root / "images" / "val",
+            label_dir=runtime_labels_dir / "val",
+            cat_id_to_class_idx=cat_id_to_class_idx,
+        )
+
+        runtime_yaml = runtime_root / "data.yaml"
+        data_cfg = {
+            "path": str(runtime_root),
+            "train": "images/train",
+            "val": "images/val",
+            "names": build_names_dict(class_names),
+        }
+        with open(runtime_yaml, "w") as f:
+            yaml.safe_dump(data_cfg, f, sort_keys=False)
+
+        print("COCO -> 14-class YOLO train stats:", train_stats)
+        print("COCO -> 14-class YOLO val stats:", val_stats)
+        print("Created:", runtime_yaml)
+        return runtime_root, runtime_yaml
+
     if data_yaml.exists() and labels_dir.exists():
-        return
+        return dataset_root, data_yaml
 
     if not images_dir.exists() or not annotations_dir.exists():
         raise FileNotFoundError(
@@ -497,6 +704,7 @@ def ensure_yolo_dataset(dataset_root: Path):
     print("COCO -> YOLO train stats:", train_stats)
     print("COCO -> YOLO val stats:", val_stats)
     print("Created:", data_yaml)
+    return dataset_root, data_yaml
 
 
 def get_runtime_train_params():
@@ -513,8 +721,9 @@ def get_runtime_train_params():
     }
 
 
-def prepare_runtime_yaml(dataset_root: Path):
-    original_yaml = dataset_root / "data.yaml"
+def prepare_runtime_yaml(dataset_root: Path, original_yaml: Path | None = None):
+    if original_yaml is None:
+        original_yaml = dataset_root / "data.yaml"
     if not original_yaml.exists():
         raise FileNotFoundError(f"Thiếu data.yaml trong {dataset_root}")
 
@@ -532,14 +741,17 @@ def prepare_runtime_yaml(dataset_root: Path):
     val_size = min(VAL_SIZE, len(train_pool_files))
     val_indices = set(rng.choice(len(train_pool_files), size=val_size, replace=False).tolist())
 
+    # Keep symlink-based paths intact for 14-class runtime datasets.
+    # Using resolve() would collapse images back to the source dataset root,
+    # causing Ultralytics to look for labels in the wrong labels/ directory.
     runtime_train_files = [
-        str(p.resolve()) for i, p in enumerate(train_pool_files) if i not in val_indices
+        str(p.absolute()) for i, p in enumerate(train_pool_files) if i not in val_indices
     ]
     runtime_val_files = [
-        str(p.resolve()) for i, p in enumerate(train_pool_files) if i in val_indices
+        str(p.absolute()) for i, p in enumerate(train_pool_files) if i in val_indices
     ]
     runtime_test_files = [
-        str(p.resolve()) for p in list_image_files(test_dir)
+        str(p.absolute()) for p in list_image_files(test_dir)
     ] if test_dir.exists() else []
 
     if QUICK_CHECK_MODE:
@@ -664,6 +876,7 @@ def cleanup_stage_and_memory():
 # MAIN LOOP
 # =========================
 def main():
+    validate_class_mode()
     ensure_command_exists("rclone")
     runtime_params = get_runtime_train_params()
     jobs = PREPROCESS_JOBS[:QUICK_CHECK_JOB_LIMIT] if QUICK_CHECK_MODE else PREPROCESS_JOBS
@@ -686,19 +899,21 @@ def main():
         local_download_dir = DOWNLOAD_ROOT / name
         local_extract_dir = EXTRACT_ROOT / name
 
-        dataset_root = ensure_local_job_stage(
+        source_dataset_root = ensure_local_job_stage(
             remote_path=remote_path,
             local_download_dir=local_download_dir,
             local_extract_dir=local_extract_dir,
         )
 
         # 3. tìm dataset root + rewrite yaml local
-        if str(dataset_root).startswith(str(local_extract_dir)):
-            repair_extracted_sidecars(dataset_root, local_download_dir)
-        ensure_yolo_dataset(dataset_root)
-        runtime_yaml, data_cfg, split_info = prepare_runtime_yaml(dataset_root)
+        if str(source_dataset_root).startswith(str(local_extract_dir)):
+            repair_extracted_sidecars(source_dataset_root, local_download_dir)
+        dataset_root, base_data_yaml = ensure_yolo_dataset(source_dataset_root)
+        runtime_yaml, data_cfg, split_info = prepare_runtime_yaml(dataset_root, original_yaml=base_data_yaml)
 
+        print("SOURCE_DATASET_ROOT:", source_dataset_root)
         print("DATASET_ROOT:", dataset_root)
+        print("BASE_DATA_YAML:", base_data_yaml)
         print("RUNTIME_YAML:", runtime_yaml)
         print("Train TXT:", split_info["train_txt"])
         print("Val TXT:", split_info["val_txt"])
@@ -716,6 +931,8 @@ def main():
 
         # 4. train
         run_name = f"yolov8_{name}"
+        if should_use_14class_mode():
+            run_name = f"{run_name}_14class"
         if QUICK_CHECK_MODE:
             run_name = f"{run_name}_quickcheck"
         model = YOLO(MODEL_NAME)
@@ -747,7 +964,10 @@ def main():
         row = {
             "preprocess_name": name,
             "remote_path": remote_path,
+            "class_mode": CLASS_MODE,
+            "source_dataset_root": str(source_dataset_root),
             "dataset_root": str(dataset_root),
+            "base_data_yaml": str(base_data_yaml),
             "runtime_yaml": str(runtime_yaml),
             "run_name": run_name,
             "run_dir": str(RUNS_ROOT / run_name),

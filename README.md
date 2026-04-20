@@ -1,6 +1,6 @@
 # Lung YOLOv8 Training Runner
 
-Repo này dùng [train.py](/home/bendo/Desktop/Ben/Research/Lung/train.py) để train YOLOv8 lần lượt trên nhiều bộ dữ liệu preprocessing được lưu trên remote `rclone`.
+Repo này dùng [train.py](/home/Ubuntu/LUNG_YOLO_CODE/train.py) để train YOLOv8 lần lượt trên nhiều bộ dữ liệu preprocessing được lưu trên remote `rclone`.
 
 Pipeline hiện tại làm các việc sau:
 
@@ -9,6 +9,9 @@ Pipeline hiện tại làm các việc sau:
 - tự unpack `.zip`, `.tar`, `.gz`, `.tgz`
 - sync thêm sidecar non-archive như `annotations/`
 - tự convert COCO JSON sang YOLO labels nếu dataset chưa ở format YOLO
+- hỗ trợ 2 mode label:
+  - `22` class gốc
+  - `14` class official, trong đó 8 class dư sẽ bị loại khỏi runtime dataset
 - tách `val` runtime mới từ `images/train`
 - dùng `images/val` cũ làm `test`
 - train YOLOv8
@@ -25,11 +28,17 @@ Pipeline hiện tại làm các việc sau:
 ## 2. Cài Đặt
 
 ```bash
-cd /home/bendo/Desktop/Ben/Research/Lung
+cd /home/Ubuntu/LUNG_YOLO_CODE
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -U pip
 pip install -r requirements.txt
+```
+
+Nếu máy thiếu `venv`:
+
+```bash
+sudo apt install python3.10-venv
 ```
 
 Cài `rclone`:
@@ -46,7 +55,7 @@ rclone listremotes
 
 ## 3. Các Dataset Đang Chạy
 
-Mặc định [train.py](/home/bendo/Desktop/Ben/Research/Lung/train.py) loop qua:
+Mặc định [train.py](/home/Ubuntu/LUNG_YOLO_CODE/train.py) loop qua:
 
 - `vinbigdata-CLAHE-png`
 - `vinbigdata-HistogramEq-png`
@@ -54,9 +63,9 @@ Mặc định [train.py](/home/bendo/Desktop/Ben/Research/Lung/train.py) loop qu
 - `vinbigdata-percentile-png`
 - `vinbigdata-raw_minmax-png`
 - `vinbigdata-rescale_minmax-png`
+- `vindr_yolo_dataset`
 - `vinbigdata-lut-png`
 - `vinbigdata-expert-png`
-- `vindr_yolo_dataset`
 
 Tên job local tương ứng:
 
@@ -66,9 +75,9 @@ Tên job local tương ứng:
 - `percentile`
 - `raw_minmax`
 - `rescale_minmax`
-- `lut`
-- `expert-window`
 - `base_dataset`
+- `LUT`
+- `expert_window`
 
 Remote base mặc định:
 
@@ -134,6 +143,38 @@ Seed tách split hiện tại là `42`.
 
 ## 6. Biến Môi Trường Quan Trọng
 
+### Class mode
+
+- `YOLO_CLASS_MODE=22`
+  - train theo full 22 class gốc
+- `YOLO_CLASS_MODE=14`
+  - train theo 14 class official
+  - script dựng runtime dataset riêng dưới `dataset_root/.yolo_runtime_14class/`
+  - giữ đúng 14 class sau:
+    - `Aortic enlargement`
+    - `Atelectasis`
+    - `Calcification`
+    - `Cardiomegaly`
+    - `Consolidation`
+    - `ILD`
+    - `Infiltration`
+    - `Lung Opacity`
+    - `Nodule/Mass`
+    - `Other lesion`
+    - `Pleural effusion`
+    - `Pleural thickening`
+    - `Pneumothorax`
+    - `Pulmonary fibrosis`
+  - bỏ 8 class dư:
+    - `Clavicle fracture`
+    - `Edema`
+    - `Emphysema`
+    - `Enlarged PA`
+    - `Lung cavity`
+    - `Lung cyst`
+    - `Mediastinal shift`
+    - `Rib fracture`
+
 ### Quick check
 
 - `YOLO_QUICK_CHECK=1`
@@ -166,7 +207,7 @@ YOLO_WORK_ROOT=./yolo_preprocess_runner
 
 ## 7. Tham Số Train Mặc Định
 
-Các tham số đang hard-code trong [train.py](/home/bendo/Desktop/Ben/Research/Lung/train.py):
+Các tham số đang hard-code trong [train.py](/home/Ubuntu/LUNG_YOLO_CODE/train.py):
 
 - `MODEL_NAME="yolov8n.pt"`
 - `EPOCHS=50`
@@ -182,8 +223,9 @@ Muốn đổi thì sửa trực tiếp file.
 Quick check 1 job:
 
 ```bash
-cd /home/bendo/Desktop/Ben/Research/Lung
+cd /home/Ubuntu/LUNG_YOLO_CODE
 source .venv/bin/activate
+export YOLO_CLASS_MODE=22
 export YOLO_QUICK_CHECK=1
 python train.py
 ```
@@ -198,9 +240,17 @@ Quick check mặc định:
 - `imgsz=640`
 - `batch=4`
 
+Lưu ý:
+
+- nếu log in ra `Image sizes 640 train, 640 val` thì đó là do đang chạy quick check
+- không phải dataset bị resize permanent
+- muốn dùng size full theo config chính thì tắt quick check hoặc set:
+  - `YOLO_QUICK_CHECK_IMGSZ=1024`
+
 Quick check nhiều job liên tiếp:
 
 ```bash
+export YOLO_CLASS_MODE=22
 export YOLO_QUICK_CHECK=1
 export YOLO_QUICK_CHECK_JOB_LIMIT=3
 export YOLO_QUICK_CHECK_TRAIN_SAMPLES=128
@@ -213,8 +263,9 @@ python train.py 2>&1 | tee multi_quickcheck.log
 Quick check toàn bộ danh sách nhưng vẫn nhẹ:
 
 ```bash
+export YOLO_CLASS_MODE=22
 export YOLO_QUICK_CHECK=1
-export YOLO_QUICK_CHECK_JOB_LIMIT=7
+export YOLO_QUICK_CHECK_JOB_LIMIT=9
 export YOLO_QUICK_CHECK_TRAIN_SAMPLES=64
 export YOLO_QUICK_CHECK_VAL_SAMPLES=16
 export YOLO_QUICK_CHECK_TEST_SAMPLES=16
@@ -222,20 +273,60 @@ export YOLO_QUICK_CHECK_EPOCHS=1
 python train.py 2>&1 | tee all_jobs_smoke.log
 ```
 
+Quick check 14 class:
+
+```bash
+export YOLO_CLASS_MODE=14
+export YOLO_QUICK_CHECK=1
+python train.py 2>&1 | tee quickcheck_14class.log
+```
+
 ## 9. Chạy Full
 
 Chạy full:
 
 ```bash
-cd /home/bendo/Desktop/Ben/Research/Lung
+cd /home/Ubuntu/LUNG_YOLO_CODE
 source .venv/bin/activate
+export YOLO_CLASS_MODE=22
 python train.py
 ```
+
+Chạy full 14 class:
+
+```bash
+cd /home/Ubuntu/LUNG_YOLO_CODE
+source .venv/bin/activate
+export YOLO_CLASS_MODE=14
+python train.py
+```
+
+Lưu ý với mode 14 class:
+
+- script tạo runtime dataset tạm dưới:
+  - `dataset_root/.yolo_runtime_14class/`
+- ảnh được symlink từ dataset gốc
+- label được tạo mới theo đúng 14 class official
+- dataset gốc 22-class không bị sửa
 
 Chạy full sạch từ đầu:
 
 ```bash
-YOLO_FORCE_RECOPY=1 YOLO_FORCE_REUNPACK=1 YOLO_KEEP_STAGE=1 python train.py
+YOLO_CLASS_MODE=22 YOLO_FORCE_RECOPY=1 YOLO_FORCE_REUNPACK=1 YOLO_KEEP_STAGE=1 python train.py
+```
+
+Chạy full sạch từ đầu cho 14 class:
+
+```bash
+YOLO_CLASS_MODE=14 YOLO_FORCE_RECOPY=1 YOLO_FORCE_REUNPACK=1 YOLO_KEEP_STAGE=1 python train.py
+```
+
+Nếu muốn vừa chạy sạch vừa lưu log:
+
+```bash
+cd /home/Ubuntu/LUNG_YOLO_CODE
+source .venv/bin/activate
+YOLO_CLASS_MODE=14 YOLO_FORCE_RECOPY=1 YOLO_FORCE_REUNPACK=1 YOLO_KEEP_STAGE=1 python train.py 2>&1 | tee full_train_14class_clean.log
 ```
 
 Giải thích:
@@ -256,25 +347,37 @@ sudo apt install -y tmux
 Chạy full nền và ghi log:
 
 ```bash
-tmux new -d -s yolo_full 'cd /home/bendo/Desktop/Ben/Research/Lung && source .venv/bin/activate && python train.py 2>&1 | tee full_train.log'
+tmux new -d -s yolo_full 'cd /home/Ubuntu/LUNG_YOLO_CODE && source .venv/bin/activate && YOLO_CLASS_MODE=22 python train.py 2>&1 | tee full_train.log'
+```
+
+Chạy full 14 class trong `tmux`:
+
+```bash
+tmux new -d -s yolo_full_14 'cd /home/Ubuntu/LUNG_YOLO_CODE && source .venv/bin/activate && YOLO_CLASS_MODE=14 python train.py 2>&1 | tee full_train_14class.log'
 ```
 
 Chạy full nhưng giữ local stage:
 
 ```bash
-tmux new -d -s yolo_full_keep 'cd /home/bendo/Desktop/Ben/Research/Lung && source .venv/bin/activate && YOLO_KEEP_STAGE=1 python train.py 2>&1 | tee full_train_keep.log'
+tmux new -d -s yolo_full_keep 'cd /home/Ubuntu/LUNG_YOLO_CODE && source .venv/bin/activate && YOLO_CLASS_MODE=22 YOLO_KEEP_STAGE=1 python train.py 2>&1 | tee full_train_keep.log'
 ```
 
 Chạy full sạch từ đầu:
 
 ```bash
-tmux new -d -s yolo_full_clean 'cd /home/bendo/Desktop/Ben/Research/Lung && source .venv/bin/activate && YOLO_FORCE_RECOPY=1 YOLO_FORCE_REUNPACK=1 YOLO_KEEP_STAGE=1 python train.py 2>&1 | tee full_train_clean.log'
+tmux new -d -s yolo_full_clean 'cd /home/Ubuntu/LUNG_YOLO_CODE && source .venv/bin/activate && YOLO_CLASS_MODE=22 YOLO_FORCE_RECOPY=1 YOLO_FORCE_REUNPACK=1 YOLO_KEEP_STAGE=1 python train.py 2>&1 | tee full_train_clean.log'
+```
+
+Chạy full sạch từ đầu cho 14 class trong `tmux`:
+
+```bash
+tmux new -d -s yolo_full_14_clean 'cd /home/Ubuntu/LUNG_YOLO_CODE && source .venv/bin/activate && YOLO_CLASS_MODE=14 YOLO_FORCE_RECOPY=1 YOLO_FORCE_REUNPACK=1 YOLO_KEEP_STAGE=1 python train.py 2>&1 | tee full_train_14class_clean.log'
 ```
 
 Chạy quick check trong `tmux`:
 
 ```bash
-tmux new -d -s yolo_quickcheck 'cd /home/bendo/Desktop/Ben/Research/Lung && source .venv/bin/activate && YOLO_QUICK_CHECK=1 python train.py 2>&1 | tee quickcheck.log'
+tmux new -d -s yolo_quickcheck 'cd /home/Ubuntu/LUNG_YOLO_CODE && source .venv/bin/activate && YOLO_CLASS_MODE=22 YOLO_QUICK_CHECK=1 python train.py 2>&1 | tee quickcheck.log'
 ```
 
 Lệnh hay dùng:
@@ -295,20 +398,21 @@ Detach mà không kill job:
 Nếu chạy với `tee`:
 
 ```bash
-tail -f /home/bendo/Desktop/Ben/Research/Lung/full_train.log
-tail -f /home/bendo/Desktop/Ben/Research/Lung/quickcheck.log
+tail -f /home/Ubuntu/LUNG_YOLO_CODE/full_train.log
+tail -f /home/Ubuntu/LUNG_YOLO_CODE/quickcheck.log
+tail -f /home/Ubuntu/LUNG_YOLO_CODE/full_train_14class.log
 ```
 
 Xem 100 dòng cuối:
 
 ```bash
-tail -n 100 /home/bendo/Desktop/Ben/Research/Lung/full_train.log
+tail -n 100 /home/Ubuntu/LUNG_YOLO_CODE/full_train.log
 ```
 
 Tìm lỗi nhanh:
 
 ```bash
-grep -i "traceback\\|error\\|failed" /home/bendo/Desktop/Ben/Research/Lung/full_train.log
+grep -i "traceback\\|error\\|failed" /home/Ubuntu/LUNG_YOLO_CODE/full_train.log
 ```
 
 Check process:
@@ -347,6 +451,11 @@ Các output chính:
   - `train_args.yaml`
 - `./yolo_preprocess_runner/training_summary.csv`
   - bảng tổng hợp tất cả job đã chạy trong phiên hiện tại
+- nếu chạy `YOLO_CLASS_MODE=14`, mỗi dataset sẽ có runtime root riêng:
+  - `dataset_root/.yolo_runtime_14class/`
+  - đây là dataset tạm đã lọc về đúng 14 class
+  - `images/` là symlink sang ảnh gốc
+  - `labels/` là label 14-class mới được sinh ra
 
 ## 13. Sau Khi Chạy Xong Nó Xóa Gì
 
@@ -428,9 +537,9 @@ Nếu vẫn lỗi cùng một ảnh sau khi chạy sạch, vấn đề nằm ở
 
 ## 16. File Chính Trong Repo
 
-- [train.py](/home/bendo/Desktop/Ben/Research/Lung/train.py)
+- [train.py](/home/Ubuntu/LUNG_YOLO_CODE/train.py)
   - pipeline train chính
-- [requirements.txt](/home/bendo/Desktop/Ben/Research/Lung/requirements.txt)
+- [requirements.txt](/home/Ubuntu/LUNG_YOLO_CODE/requirements.txt)
   - dependency runtime
-- [README.md](/home/bendo/Desktop/Ben/Research/Lung/README.md)
+- [README.md](/home/Ubuntu/LUNG_YOLO_CODE/README.md)
   - tài liệu sử dụng

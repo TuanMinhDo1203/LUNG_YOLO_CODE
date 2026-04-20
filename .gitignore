@@ -1,0 +1,6 @@
+rclone.conf
+*.pt
+*.log
+yolo_preprocess_runner/
+.venv/
+runs/
