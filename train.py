@@ -6,6 +6,7 @@ import shutil as shutil_lib
 import shutil
 import subprocess
 import zipfile
+from collections import Counter
 
 import numpy as np
 import pandas as pd
@@ -26,6 +27,7 @@ WORKERS = 4
 
 SPLIT_SEED = 42
 VAL_SIZE = 3000
+CSV_SPLIT_RATIOS = {"train": 0.70, "val": 0.10, "test": 0.20}
 
 QUICK_CHECK_MODE = os.environ.get("YOLO_QUICK_CHECK", "0") == "1"
 QUICK_CHECK_JOB_LIMIT = int(os.environ.get("YOLO_QUICK_CHECK_JOB_LIMIT", "1"))
@@ -39,6 +41,24 @@ FORCE_RECOPY = os.environ.get("YOLO_FORCE_RECOPY", "0") == "1"
 FORCE_REUNPACK = os.environ.get("YOLO_FORCE_REUNPACK", "0") == "1"
 KEEP_STAGE = os.environ.get("YOLO_KEEP_STAGE", "0") == "1"
 CLASS_MODE = os.environ.get("YOLO_CLASS_MODE", "22").strip()
+DEFAULT_LABEL_CSV = Path(__file__).with_name("annotations_all_merged_other_1000nf.csv")
+LABEL_CSV = os.environ.get(
+    "YOLO_LABEL_CSV",
+    str(DEFAULT_LABEL_CSV) if DEFAULT_LABEL_CSV.exists() else "",
+).strip()
+CSV_BBOX_FORMAT = os.environ.get("YOLO_CSV_BBOX_FORMAT", "auto").strip().lower()
+CSV_BACKGROUND_CLASS = os.environ.get("YOLO_CSV_BACKGROUND_CLASS", "No finding").strip()
+CSV_IMAGE_ID_COL = os.environ.get("YOLO_CSV_IMAGE_ID_COL", "image_id").strip()
+CSV_CLASS_COL = os.environ.get("YOLO_CSV_CLASS_COL", "class_name").strip()
+CSV_SAMPLE_ID_COL = os.environ.get("YOLO_CSV_SAMPLE_ID_COL", "sample_id").strip()
+CSV_SOURCE_COL = os.environ.get("YOLO_CSV_SOURCE_COL", "source").strip()
+CSV_FILENAME_COL = os.environ.get("YOLO_CSV_FILENAME_COL", "").strip()
+CSV_SCORE_COL = os.environ.get("YOLO_CSV_SCORE_COL", "score").strip()
+CSV_IMAGE_WIDTH_COL = os.environ.get("YOLO_CSV_IMAGE_WIDTH_COL", "").strip()
+CSV_IMAGE_HEIGHT_COL = os.environ.get("YOLO_CSV_IMAGE_HEIGHT_COL", "").strip()
+WBF_IOU_THRESHOLD = float(os.environ.get("YOLO_WBF_IOU_THRESHOLD", "0.5"))
+WBF_SKIP_BOX_THRESHOLD = float(os.environ.get("YOLO_WBF_SKIP_BOX_THRESHOLD", "0.0"))
+CSV_RUNTIME_REBUILD = os.environ.get("YOLO_CSV_RUNTIME_REBUILD", "1") == "1"
 
 OFFICIAL_14_CLASS_NAMES = [
     "Aortic enlargement",
@@ -104,6 +124,7 @@ print("FORCE_RECOPY:", FORCE_RECOPY)
 print("FORCE_REUNPACK:", FORCE_REUNPACK)
 print("KEEP_STAGE:", KEEP_STAGE)
 print("CLASS_MODE:", CLASS_MODE)
+print("LABEL_CSV:", LABEL_CSV if LABEL_CSV else "(disabled)")
 
 
 # =========================
@@ -794,6 +815,780 @@ def prepare_runtime_yaml(dataset_root: Path, original_yaml: Path | None = None):
     return runtime_yaml, runtime_cfg, split_info
 
 
+def csv_mode_enabled():
+    return bool(LABEL_CSV)
+
+
+def normalize_split_ratios(split_ratios):
+    split_ratios = dict(split_ratios)
+    total = sum(float(v) for v in split_ratios.values())
+    if total <= 0:
+        raise ValueError("CSV split ratios must sum to > 0")
+    return {k: float(v) / total for k, v in split_ratios.items()}
+
+
+def compute_target_sizes(n_items, split_ratios):
+    raw = {split: n_items * ratio for split, ratio in split_ratios.items()}
+    sizes = {split: int(np.floor(value)) for split, value in raw.items()}
+    remaining = n_items - sum(sizes.values())
+
+    order = sorted(
+        split_ratios.keys(),
+        key=lambda split: (raw[split] - sizes[split], split),
+        reverse=True,
+    )
+    for split in order[:remaining]:
+        sizes[split] += 1
+
+    nonzero_splits = [split for split, ratio in split_ratios.items() if ratio > 0]
+    if n_items >= len(nonzero_splits):
+        for split in nonzero_splits:
+            if sizes[split] == 0:
+                donor = max(sizes, key=sizes.get)
+                sizes[donor] -= 1
+                sizes[split] += 1
+
+    return sizes
+
+
+def is_background_class(class_name):
+    normalized = str(class_name).strip().lower().replace("_", " ")
+    background_names = {
+        CSV_BACKGROUND_CLASS.strip().lower().replace("_", " "),
+        "no finding",
+        "background",
+        "negative",
+    }
+    return normalized in background_names
+
+
+def first_existing_column(df, explicit_col, candidates):
+    if explicit_col and explicit_col in df.columns:
+        return explicit_col
+    for col in candidates:
+        if col in df.columns:
+            return col
+    return None
+
+
+def normalize_label_csv(csv_path: Path):
+    csv_path = Path(csv_path).expanduser().resolve()
+    if not csv_path.exists():
+        raise FileNotFoundError(f"Không thấy YOLO_LABEL_CSV: {csv_path}")
+
+    df_raw = pd.read_csv(csv_path)
+    print("CSV label path:", csv_path)
+    print("CSV shape:", df_raw.shape)
+    print("CSV columns:", df_raw.columns.tolist())
+
+    required = [CSV_IMAGE_ID_COL, CSV_CLASS_COL, "x_min", "y_min", "x_max", "y_max"]
+    missing = [col for col in required if col not in df_raw.columns]
+    if missing:
+        raise ValueError(f"CSV thiếu cột bắt buộc: {missing}")
+
+    df = df_raw.copy()
+    df["image_id"] = df[CSV_IMAGE_ID_COL].astype("string").str.strip()
+    df["class_name"] = df[CSV_CLASS_COL].astype("string").str.strip()
+    df = df.dropna(subset=["image_id", "class_name"]).copy()
+
+    source_col = first_existing_column(
+        df,
+        CSV_SOURCE_COL,
+        ["source", "original_split", "split"],
+    )
+    if source_col:
+        df["source"] = df[source_col].astype("string").str.strip()
+        print("CSV source column:", source_col)
+    else:
+        df["source"] = ""
+        print("CSV source column: not found")
+
+    if CSV_SAMPLE_ID_COL and CSV_SAMPLE_ID_COL in df.columns:
+        df["sample_id"] = df[CSV_SAMPLE_ID_COL].astype("string").str.strip()
+    else:
+        df["sample_id"] = df["image_id"].astype(str)
+
+    filename_col = first_existing_column(
+        df,
+        CSV_FILENAME_COL,
+        ["file_name", "filename", "image_path", "path"],
+    )
+    if filename_col:
+        df["csv_file_name"] = df[filename_col].astype("string").str.strip()
+    else:
+        df["csv_file_name"] = ""
+
+    width_col = first_existing_column(
+        df,
+        CSV_IMAGE_WIDTH_COL,
+        ["image_width", "img_width", "original_width", "orig_width", "width"],
+    )
+    height_col = first_existing_column(
+        df,
+        CSV_IMAGE_HEIGHT_COL,
+        ["image_height", "img_height", "original_height", "orig_height", "height"],
+    )
+    if width_col and height_col:
+        df["source_width"] = pd.to_numeric(df[width_col], errors="coerce")
+        df["source_height"] = pd.to_numeric(df[height_col], errors="coerce")
+        print("CSV image size columns:", width_col, height_col)
+    else:
+        df["source_width"] = np.nan
+        df["source_height"] = np.nan
+        print("CSV image size columns: not found; pixel boxes will use actual image size")
+
+    if CSV_SCORE_COL and CSV_SCORE_COL in df.columns:
+        df["box_score"] = pd.to_numeric(df[CSV_SCORE_COL], errors="coerce").fillna(1.0)
+        print("CSV WBF score column:", CSV_SCORE_COL)
+    else:
+        df["box_score"] = 1.0
+        print("CSV WBF score column: not found; all boxes weight=1")
+
+    for col in ["x_min", "y_min", "x_max", "y_max"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df["is_background"] = df["class_name"].map(is_background_class)
+    all_sample_ids = sorted(df["sample_id"].dropna().astype(str).str.strip().unique().tolist())
+
+    ann_df = df[~df["is_background"]].copy()
+    ann_df = ann_df.dropna(subset=["sample_id", "class_name", "x_min", "y_min", "x_max", "y_max"]).copy()
+    ann_df = ann_df[
+        (ann_df["x_max"] > ann_df["x_min"])
+        & (ann_df["y_max"] > ann_df["y_min"])
+        & (ann_df["box_score"] >= WBF_SKIP_BOX_THRESHOLD)
+    ].copy()
+
+    class_names = sorted(ann_df["class_name"].astype(str).unique().tolist())
+    if not class_names:
+        raise ValueError("CSV không có class bất thường hợp lệ sau khi bỏ background/No finding")
+
+    print("CSV unique samples:", len(all_sample_ids))
+    print("CSV abnormal samples:", ann_df["sample_id"].nunique())
+    print("CSV background-only samples:", len(set(all_sample_ids) - set(ann_df["sample_id"].astype(str).unique())))
+    print("CSV num classes:", len(class_names))
+    print("CSV class names:", class_names)
+
+    return df.reset_index(drop=True), ann_df.reset_index(drop=True), all_sample_ids, class_names
+
+
+def compute_iou_xyxy(box_a, box_b):
+    x1 = max(float(box_a[0]), float(box_b[0]))
+    y1 = max(float(box_a[1]), float(box_b[1]))
+    x2 = min(float(box_a[2]), float(box_b[2]))
+    y2 = min(float(box_a[3]), float(box_b[3]))
+    inter_w = max(0.0, x2 - x1)
+    inter_h = max(0.0, y2 - y1)
+    inter = inter_w * inter_h
+    if inter <= 0.0:
+        return 0.0
+    area_a = max(0.0, float(box_a[2]) - float(box_a[0])) * max(0.0, float(box_a[3]) - float(box_a[1]))
+    area_b = max(0.0, float(box_b[2]) - float(box_b[0])) * max(0.0, float(box_b[3]) - float(box_b[1]))
+    union = area_a + area_b - inter
+    if union <= 0.0:
+        return 0.0
+    return inter / union
+
+
+def weighted_fuse_group(group_df):
+    if len(group_df) <= 1:
+        return group_df.copy()
+
+    rows = []
+    work = group_df.copy()
+    work["_score_sort"] = pd.to_numeric(work["box_score"], errors="coerce").fillna(1.0)
+    work = work.sort_values("_score_sort", ascending=False).reset_index(drop=True)
+
+    clusters = []
+    for idx, row in work.iterrows():
+        box = row[["x_min", "y_min", "x_max", "y_max"]].to_numpy(dtype=float)
+        score = float(row.get("box_score", 1.0))
+        best_cluster = None
+        best_iou = 0.0
+
+        for cluster_idx, cluster in enumerate(clusters):
+            iou = compute_iou_xyxy(box, cluster["box"])
+            if iou >= WBF_IOU_THRESHOLD and iou > best_iou:
+                best_iou = iou
+                best_cluster = cluster_idx
+
+        if best_cluster is None:
+            clusters.append({
+                "indices": [idx],
+                "boxes": [box],
+                "scores": [score],
+                "box": box.copy(),
+            })
+            continue
+
+        cluster = clusters[best_cluster]
+        cluster["indices"].append(idx)
+        cluster["boxes"].append(box)
+        cluster["scores"].append(score)
+        weights = np.asarray(cluster["scores"], dtype=float)
+        weights = np.maximum(weights, 1e-6)
+        cluster["box"] = np.average(np.asarray(cluster["boxes"], dtype=float), axis=0, weights=weights)
+
+    for cluster in clusters:
+        fused = work.loc[cluster["indices"]].iloc[0].copy()
+        weights = np.asarray(cluster["scores"], dtype=float)
+        weights = np.maximum(weights, 1e-6)
+        fused_box = np.average(np.asarray(cluster["boxes"], dtype=float), axis=0, weights=weights)
+        fused["x_min"] = float(fused_box[0])
+        fused["y_min"] = float(fused_box[1])
+        fused["x_max"] = float(fused_box[2])
+        fused["y_max"] = float(fused_box[3])
+        fused["box_score"] = float(np.mean(cluster["scores"]))
+        fused["fusion_group_size"] = int(len(cluster["indices"]))
+        fused["was_fused"] = bool(len(cluster["indices"]) > 1)
+        rows.append(fused.drop(labels=["_score_sort"], errors="ignore"))
+
+    return pd.DataFrame(rows)
+
+
+def apply_wbf_to_annotations(ann_df):
+    fused_groups = []
+    grouped = ann_df.groupby(["sample_id", "class_name"], sort=False, group_keys=False)
+    for _, group in grouped:
+        fused_groups.append(weighted_fuse_group(group))
+
+    if not fused_groups:
+        return ann_df.copy()
+
+    fused_df = pd.concat(fused_groups, ignore_index=True).reset_index(drop=True)
+    print("WBF enabled")
+    print("WBF IoU threshold:", WBF_IOU_THRESHOLD)
+    print("Boxes before WBF:", len(ann_df))
+    print("Boxes after WBF:", len(fused_df))
+    print("Rows created from fused clusters:", int(fused_df.get("was_fused", pd.Series(dtype=bool)).sum()))
+    return fused_df
+
+
+def build_image_class_sets(ann_df, sample_ids):
+    sample_ids = sorted(set(map(str, sample_ids)))
+    grouped = (
+        ann_df.groupby("sample_id")["class_name"]
+        .apply(lambda x: sorted(set(map(str, x))))
+        .to_dict()
+    )
+    return {
+        sample_id: grouped.get(sample_id, [CSV_BACKGROUND_CLASS])
+        for sample_id in sample_ids
+    }
+
+
+def build_multilabel_stratified_split(ann_df, sample_ids, split_ratios=None, seed=42):
+    split_ratios = normalize_split_ratios(split_ratios or CSV_SPLIT_RATIOS)
+    rng = np.random.default_rng(seed)
+
+    sample_ids = sorted(set(map(str, sample_ids)))
+    image_class_sets = build_image_class_sets(ann_df, sample_ids)
+    split_names = list(split_ratios.keys())
+
+    target_sizes = compute_target_sizes(len(sample_ids), split_ratios)
+    class_total = Counter(cls for classes in image_class_sets.values() for cls in classes)
+    target_class_counts = {
+        split: {cls: class_total[cls] * split_ratios[split] for cls in class_total}
+        for split in split_names
+    }
+
+    current_sizes = {split: 0 for split in split_names}
+    current_class_counts = {split: Counter() for split in split_names}
+    split_sets = {split: set() for split in split_names}
+
+    ordered_ids = sorted(
+        sample_ids,
+        key=lambda sample_id: (
+            -sum(1.0 / max(class_total[cls], 1) for cls in image_class_sets[sample_id]),
+            -len(image_class_sets[sample_id]),
+            rng.random(),
+        ),
+    )
+
+    for sample_id in ordered_ids:
+        classes = image_class_sets[sample_id]
+        candidates = [split for split in split_names if current_sizes[split] < target_sizes[split]]
+        if not candidates:
+            candidates = split_names
+
+        best_split = None
+        best_score = None
+
+        for split in candidates:
+            size_deficit = (target_sizes[split] - current_sizes[split]) / max(target_sizes[split], 1)
+            class_deficit = 0.0
+            over_penalty = 0.0
+
+            for cls in classes:
+                target = max(target_class_counts[split][cls], 1e-9)
+                before = current_class_counts[split][cls]
+                after = before + 1
+                class_deficit += max(target - before, 0.0) / target
+                over_penalty += max(after - target, 0.0) / target
+
+            score = size_deficit + class_deficit - over_penalty + rng.random() * 1e-6
+            if best_score is None or score > best_score:
+                best_score = score
+                best_split = split
+
+        split_sets[best_split].add(sample_id)
+        current_sizes[best_split] += 1
+        for cls in classes:
+            current_class_counts[best_split][cls] += 1
+
+    return split_sets, image_class_sets
+
+
+def summarize_split_distribution(split_sets, image_class_sets):
+    class_names = sorted({cls for classes in image_class_sets.values() for cls in classes})
+    rows = []
+    for cls in class_names:
+        total = sum(1 for classes in image_class_sets.values() if cls in classes)
+        row = {"class_name": cls, "total_images": total}
+        for split, ids in split_sets.items():
+            count = sum(1 for sample_id in ids if cls in image_class_sets[sample_id])
+            row[f"{split}_images"] = count
+            row[f"{split}_pct_of_class"] = round(100.0 * count / total, 2) if total else 0.0
+        rows.append(row)
+    return pd.DataFrame(rows).sort_values("class_name").reset_index(drop=True)
+
+
+def image_source_aliases(source):
+    source = str(source or "").strip().lower()
+    if source == "train":
+        return ["train"]
+    if source == "test":
+        return ["test", "val"]
+    if source == "val":
+        return ["val"]
+    return []
+
+
+def strip_source_prefix(value):
+    value = str(value).strip()
+    if "__" in value:
+        return value.split("__", 1)[1]
+    return value
+
+
+def build_image_index(dataset_root: Path):
+    images_root = dataset_root / "images"
+    files = list_image_files(images_root)
+    if not files:
+        raise FileNotFoundError(f"Không tìm thấy ảnh dưới {images_root}")
+
+    by_stem = {}
+    by_source_stem = {}
+    for path in files:
+        by_stem.setdefault(path.stem, []).append(path)
+        rel_parts = path.relative_to(images_root).parts
+        if len(rel_parts) >= 2:
+            split_name = rel_parts[0].lower()
+            by_source_stem.setdefault((split_name, path.stem), []).append(path)
+
+    return by_stem, by_source_stem, files
+
+
+def candidate_stems_for_row(row):
+    values = []
+    for value in [
+        row.get("csv_file_name", ""),
+        row.get("sample_id", ""),
+        row.get("image_id", ""),
+        strip_source_prefix(row.get("sample_id", "")),
+    ]:
+        if pd.isna(value):
+            continue
+        value = str(value).strip()
+        if not value:
+            continue
+        values.append(Path(value).stem)
+    return list(dict.fromkeys(values))
+
+
+def resolve_image_for_row(row, by_stem, by_source_stem):
+    stems = candidate_stems_for_row(row)
+    source_aliases = image_source_aliases(row.get("source", ""))
+
+    for alias in source_aliases:
+        for stem in stems:
+            matches = by_source_stem.get((alias, stem), [])
+            if matches:
+                return sorted(matches)[0]
+
+    for stem in stems:
+        matches = by_stem.get(stem, [])
+        if matches:
+            return sorted(matches)[0]
+
+    return None
+
+
+def build_image_records(dataset_root: Path, csv_df, sample_ids):
+    by_stem, by_source_stem, all_image_files = build_image_index(dataset_root)
+    lookup_df = (
+        csv_df[csv_df["sample_id"].astype(str).isin(set(map(str, sample_ids)))]
+        [["sample_id", "image_id", "source", "csv_file_name"]]
+        .drop_duplicates("sample_id")
+        .reset_index(drop=True)
+    )
+
+    records = {}
+    missing = []
+    for row in lookup_df.itertuples(index=False):
+        row_dict = row._asdict()
+        path = resolve_image_for_row(row_dict, by_stem, by_source_stem)
+        sample_id = str(row_dict["sample_id"])
+        if path is None:
+            missing.append(sample_id)
+            continue
+        records[sample_id] = {
+            "sample_id": sample_id,
+            "image_id": str(row_dict["image_id"]),
+            "source": str(row_dict.get("source", "")),
+            "path": path,
+        }
+
+    missing = sorted(set(missing) | (set(map(str, sample_ids)) - set(records.keys())))
+    print("Dataset image files indexed:", len(all_image_files))
+    print("CSV requested samples:", len(set(map(str, sample_ids))))
+    print("CSV matched images:", len(records))
+    print("CSV missing images:", len(missing))
+    if missing:
+        print("First missing CSV samples:", missing[:10])
+    return records, missing
+
+
+def collect_coco_image_size_lookup(dataset_root: Path):
+    annotations_root = dataset_root / "annotations"
+    if not annotations_root.exists():
+        return {}
+
+    size_lookup = {}
+    for ann_path in sorted(annotations_root.rglob("*.json")):
+        try:
+            with open(ann_path, "r") as f:
+                data = json.load(f)
+        except Exception as e:
+            print("Skip unreadable annotation size file:", ann_path, e)
+            continue
+
+        for image_info in data.get("images", []):
+            file_name = str(image_info.get("file_name", "")).strip()
+            if not file_name:
+                continue
+            width = image_info.get("width")
+            height = image_info.get("height")
+            try:
+                width = float(width)
+                height = float(height)
+            except Exception:
+                continue
+            if width <= 0 or height <= 0:
+                continue
+
+            stem = Path(file_name).stem
+            size_lookup.setdefault(stem, (width, height))
+
+    if size_lookup:
+        print("Loaded image sizes from COCO annotations:", len(size_lookup))
+    else:
+        print("No image sizes loaded from COCO annotations")
+    return size_lookup
+
+
+def read_image_size(path: Path):
+    try:
+        import cv2
+        img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if img is not None:
+            h, w = img.shape[:2]
+            return int(w), int(h)
+    except Exception:
+        pass
+
+    try:
+        from PIL import Image
+        with Image.open(path) as img:
+            return int(img.width), int(img.height)
+    except Exception as e:
+        raise RuntimeError(
+            f"Không đọc được kích thước ảnh {path}. Cài opencv-python hoặc Pillow, "
+            "hoặc thêm image_width/image_height vào CSV."
+        ) from e
+
+
+def sanitize_file_stem(value):
+    text = str(value).strip()
+    for ch in ["/", "\\", ":", "*", "?", "\"", "<", ">", "|", " "]:
+        text = text.replace(ch, "_")
+    return text
+
+
+def symlink_image(src: Path, dst: Path):
+    safe_remove(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.symlink_to(src.absolute())
+
+
+def sample_source_size(rows):
+    if rows is None or len(rows) == 0:
+        return None
+    widths = pd.to_numeric(rows.get("source_width", pd.Series(dtype=float)), errors="coerce").dropna()
+    heights = pd.to_numeric(rows.get("source_height", pd.Series(dtype=float)), errors="coerce").dropna()
+    if len(widths) > 0 and len(heights) > 0 and float(widths.iloc[0]) > 0 and float(heights.iloc[0]) > 0:
+        return float(widths.iloc[0]), float(heights.iloc[0])
+    return None
+
+
+def lookup_source_size(sample_id, rows, image_records, size_lookup):
+    source_size = sample_source_size(rows)
+    if source_size is not None:
+        return source_size
+
+    record = image_records.get(str(sample_id), {})
+    candidates = [
+        record.get("image_id", ""),
+        strip_source_prefix(sample_id),
+        Path(str(record.get("path", ""))).stem,
+    ]
+    for candidate in candidates:
+        key = str(candidate).strip()
+        if key in size_lookup:
+            return size_lookup[key]
+    return None
+
+
+def detect_bbox_format(rows, source_size, actual_size):
+    if CSV_BBOX_FORMAT != "auto":
+        return CSV_BBOX_FORMAT
+    if rows is None or len(rows) == 0:
+        return "xyxy_pixel"
+    coords = rows[["x_min", "y_min", "x_max", "y_max"]].to_numpy(dtype=float)
+    finite = coords[np.isfinite(coords)]
+    if finite.size and np.nanmax(finite) <= 1.05 and np.nanmin(finite) >= -0.05:
+        return "xyxy_norm"
+    if source_size is not None:
+        source_w, source_h = source_size
+        max_x = np.nanmax(coords[:, [0, 2]]) if coords.size else 0.0
+        max_y = np.nanmax(coords[:, [1, 3]]) if coords.size else 0.0
+        if max_x > source_w * 1.25 or max_y > source_h * 1.25:
+            raise ValueError(
+                "CSV bbox lớn hơn nhiều so với source image size tìm được. "
+                f"bbox_max=({max_x:.1f}, {max_y:.1f}), source_size=({source_w:.1f}, {source_h:.1f}). "
+                "Với file annotations_all_merged_other_1000nf.csv, bbox đang là pixel ảnh gốc; "
+                "hãy thêm cột image_width/image_height của ảnh gốc vào CSV, hoặc cung cấp annotation sidecar "
+                "có width/height ảnh gốc."
+            )
+        return "xyxy_pixel"
+    if source_size is None:
+        actual_w, actual_h = actual_size
+        max_x = np.nanmax(coords[:, [0, 2]]) if coords.size else 0.0
+        max_y = np.nanmax(coords[:, [1, 3]]) if coords.size else 0.0
+        if max_x > actual_w * 1.25 or max_y > actual_h * 1.25:
+            raise ValueError(
+                "CSV bbox có vẻ là pixel theo ảnh gốc nhưng CSV không có width/height. "
+                "Thêm cột image_width/image_height hoặc set YOLO_CSV_IMAGE_WIDTH_COL/YOLO_CSV_IMAGE_HEIGHT_COL."
+            )
+    return "xyxy_pixel"
+
+
+def row_to_yolo_line(row, class2id, source_size, actual_size, bbox_format):
+    cls_idx = class2id[str(row["class_name"])]
+    x1 = float(row["x_min"])
+    y1 = float(row["y_min"])
+    x2 = float(row["x_max"])
+    y2 = float(row["y_max"])
+
+    if bbox_format in {"xyxy_norm", "normalized_xyxy"}:
+        x1 = float(np.clip(x1, 0.0, 1.0))
+        y1 = float(np.clip(y1, 0.0, 1.0))
+        x2 = float(np.clip(x2, 0.0, 1.0))
+        y2 = float(np.clip(y2, 0.0, 1.0))
+        xc = (x1 + x2) / 2.0
+        yc = (y1 + y2) / 2.0
+        bw = x2 - x1
+        bh = y2 - y1
+    elif bbox_format in {"xyxy_pixel", "pixel_xyxy"}:
+        denom_w, denom_h = source_size if source_size is not None else actual_size
+        x1 = float(np.clip(x1, 0.0, denom_w))
+        y1 = float(np.clip(y1, 0.0, denom_h))
+        x2 = float(np.clip(x2, 0.0, denom_w))
+        y2 = float(np.clip(y2, 0.0, denom_h))
+        xc = ((x1 + x2) / 2.0) / denom_w
+        yc = ((y1 + y2) / 2.0) / denom_h
+        bw = (x2 - x1) / denom_w
+        bh = (y2 - y1) / denom_h
+    else:
+        raise ValueError(
+            f"YOLO_CSV_BBOX_FORMAT không hỗ trợ: {CSV_BBOX_FORMAT}. "
+            "Dùng auto, xyxy_pixel hoặc xyxy_norm."
+        )
+
+    xc = float(np.clip(xc, 0.0, 1.0))
+    yc = float(np.clip(yc, 0.0, 1.0))
+    bw = float(np.clip(bw, 0.0, 1.0))
+    bh = float(np.clip(bh, 0.0, 1.0))
+    if bw <= 0.0 or bh <= 0.0:
+        return None
+    return f"{cls_idx} {xc:.6f} {yc:.6f} {bw:.6f} {bh:.6f}"
+
+
+def write_label_file(label_path: Path, rows, class2id, source_size, actual_size):
+    label_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = []
+    bbox_format = detect_bbox_format(rows, source_size, actual_size)
+    for _, row in rows.iterrows():
+        line = row_to_yolo_line(row, class2id, source_size, actual_size, bbox_format)
+        if line is not None:
+            lines.append(line)
+    label_path.write_text("\n".join(lines) + ("\n" if lines else ""))
+    return len(lines), bbox_format
+
+
+def maybe_limit_split_sets(split_sets):
+    if not QUICK_CHECK_MODE:
+        return split_sets
+    limits = {
+        "train": QUICK_CHECK_TRAIN_SAMPLES,
+        "val": QUICK_CHECK_VAL_SAMPLES,
+        "test": QUICK_CHECK_TEST_SAMPLES,
+    }
+    return {
+        split: set(sorted(ids)[:limits.get(split, len(ids))])
+        for split, ids in split_sets.items()
+    }
+
+
+def prepare_csv_runtime_dataset(dataset_root: Path, job_name: str):
+    csv_df, ann_df, all_sample_ids, class_names = normalize_label_csv(Path(LABEL_CSV))
+    fused_df = apply_wbf_to_annotations(ann_df)
+
+    image_records, missing = build_image_records(dataset_root, csv_df, all_sample_ids)
+    used_sample_ids = sorted(image_records.keys())
+    if not used_sample_ids:
+        raise ValueError(f"Không match được ảnh nào từ CSV với dataset {dataset_root}")
+
+    fused_df = fused_df[fused_df["sample_id"].astype(str).isin(set(used_sample_ids))].copy()
+    class_names = sorted(fused_df["class_name"].astype(str).unique().tolist())
+    if not class_names:
+        raise ValueError("Không còn bbox bất thường nào sau khi match ảnh từ CSV")
+
+    class2id = {name: idx for idx, name in enumerate(class_names)}
+    source_size_lookup = collect_coco_image_size_lookup(dataset_root)
+    split_sets, image_class_sets = build_multilabel_stratified_split(
+        ann_df=fused_df,
+        sample_ids=used_sample_ids,
+        split_ratios=CSV_SPLIT_RATIOS,
+        seed=SPLIT_SEED,
+    )
+    split_sets = maybe_limit_split_sets(split_sets)
+
+    runtime_root = dataset_root / ".csv_runtime"
+    if CSV_RUNTIME_REBUILD:
+        safe_remove(runtime_root)
+    for split in ["train", "val", "test"]:
+        (runtime_root / "images" / split).mkdir(parents=True, exist_ok=True)
+        (runtime_root / "labels" / split).mkdir(parents=True, exist_ok=True)
+
+    ann_by_sample = {
+        str(sample_id): group.copy()
+        for sample_id, group in fused_df.groupby("sample_id", sort=False)
+    }
+
+    split_counts = {}
+    label_counts = {}
+    bbox_format_counts = Counter()
+    for split, ids in split_sets.items():
+        image_count = 0
+        label_count = 0
+        for sample_id in sorted(ids):
+            record = image_records[str(sample_id)]
+            src_image = Path(record["path"])
+            out_stem = sanitize_file_stem(sample_id)
+            dst_image = runtime_root / "images" / split / f"{out_stem}{src_image.suffix.lower()}"
+            dst_label = runtime_root / "labels" / split / f"{out_stem}.txt"
+            symlink_image(src_image, dst_image)
+
+            rows = ann_by_sample.get(str(sample_id), pd.DataFrame(columns=fused_df.columns))
+            actual_size = read_image_size(src_image)
+            source_size = lookup_source_size(
+                sample_id=sample_id,
+                rows=rows,
+                image_records=image_records,
+                size_lookup=source_size_lookup,
+            )
+            n_labels, bbox_format = write_label_file(
+                label_path=dst_label,
+                rows=rows,
+                class2id=class2id,
+                source_size=source_size,
+                actual_size=actual_size,
+            )
+            bbox_format_counts[bbox_format] += 1
+            image_count += 1
+            label_count += n_labels
+
+        split_counts[split] = image_count
+        label_counts[split] = label_count
+
+    runtime_yaml = runtime_root / "data.runtime.yaml"
+    runtime_cfg = {
+        "path": str(runtime_root),
+        "train": "images/train",
+        "val": "images/val",
+        "test": "images/test",
+        "names": build_names_dict(class_names),
+    }
+    with open(runtime_yaml, "w") as f:
+        yaml.safe_dump(runtime_cfg, f, sort_keys=False)
+
+    split_distribution_df = summarize_split_distribution(split_sets, image_class_sets)
+    split_distribution_path = runtime_root / "split_distribution.csv"
+    split_distribution_df.to_csv(split_distribution_path, index=False)
+
+    meta = {
+        "job_name": job_name,
+        "label_csv": str(Path(LABEL_CSV).expanduser().resolve()),
+        "split_ratios": normalize_split_ratios(CSV_SPLIT_RATIOS),
+        "split_seed": SPLIT_SEED,
+        "wbf_iou_threshold": WBF_IOU_THRESHOLD,
+        "wbf_skip_box_threshold": WBF_SKIP_BOX_THRESHOLD,
+        "csv_bbox_format": CSV_BBOX_FORMAT,
+        "bbox_format_counts": dict(bbox_format_counts),
+        "num_classes": len(class_names),
+        "class_names": class_names,
+        "csv_samples": len(all_sample_ids),
+        "used_samples": len(used_sample_ids),
+        "missing_samples": missing,
+        "source_size_lookup_count": len(source_size_lookup),
+        "split_counts": split_counts,
+        "label_counts": label_counts,
+    }
+    meta_path = runtime_root / "meta.json"
+    with open(meta_path, "w") as f:
+        json.dump(meta, f, indent=2, ensure_ascii=False)
+
+    split_info = {
+        "train_pool_images": len(used_sample_ids),
+        "train_images": split_counts.get("train", 0),
+        "val_images": split_counts.get("val", 0),
+        "test_images": split_counts.get("test", 0),
+        "train_txt": "",
+        "val_txt": "",
+        "test_txt": "",
+        "split_distribution": str(split_distribution_path),
+        "meta": str(meta_path),
+    }
+
+    print("Built CSV runtime dataset:", runtime_root)
+    print("CSV runtime yaml:", runtime_yaml)
+    print("CSV split counts:", split_counts)
+    print("CSV label counts:", label_counts)
+    print("CSV bbox format counts:", dict(bbox_format_counts))
+
+    return runtime_root, runtime_yaml, runtime_cfg, split_info
+
+
 def maybe_val(model, yaml_path: Path, split_name: str):
     runtime_params = get_runtime_train_params()
     try:
@@ -876,7 +1671,8 @@ def cleanup_stage_and_memory():
 # MAIN LOOP
 # =========================
 def main():
-    validate_class_mode()
+    if not csv_mode_enabled():
+        validate_class_mode()
     ensure_command_exists("rclone")
     runtime_params = get_runtime_train_params()
     jobs = PREPROCESS_JOBS[:QUICK_CHECK_JOB_LIMIT] if QUICK_CHECK_MODE else PREPROCESS_JOBS
@@ -908,16 +1704,29 @@ def main():
         # 3. tìm dataset root + rewrite yaml local
         if str(source_dataset_root).startswith(str(local_extract_dir)):
             repair_extracted_sidecars(source_dataset_root, local_download_dir)
-        dataset_root, base_data_yaml = ensure_yolo_dataset(source_dataset_root)
-        runtime_yaml, data_cfg, split_info = prepare_runtime_yaml(dataset_root, original_yaml=base_data_yaml)
+
+        if csv_mode_enabled():
+            dataset_root = source_dataset_root
+            base_data_yaml = None
+            runtime_dataset_root, runtime_yaml, data_cfg, split_info = prepare_csv_runtime_dataset(
+                dataset_root=dataset_root,
+                job_name=name,
+            )
+        else:
+            dataset_root, base_data_yaml = ensure_yolo_dataset(source_dataset_root)
+            runtime_dataset_root = dataset_root
+            runtime_yaml, data_cfg, split_info = prepare_runtime_yaml(dataset_root, original_yaml=base_data_yaml)
 
         print("SOURCE_DATASET_ROOT:", source_dataset_root)
         print("DATASET_ROOT:", dataset_root)
+        print("RUNTIME_DATASET_ROOT:", runtime_dataset_root)
         print("BASE_DATA_YAML:", base_data_yaml)
         print("RUNTIME_YAML:", runtime_yaml)
-        print("Train TXT:", split_info["train_txt"])
-        print("Val TXT:", split_info["val_txt"])
-        if split_info["test_txt"]:
+        if split_info.get("train_txt"):
+            print("Train TXT:", split_info["train_txt"])
+        if split_info.get("val_txt"):
+            print("Val TXT:", split_info["val_txt"])
+        if split_info.get("test_txt"):
             print("Test TXT:", split_info["test_txt"])
 
         train_count = split_info["train_images"]
@@ -931,7 +1740,9 @@ def main():
 
         # 4. train
         run_name = f"yolov8_{name}"
-        if should_use_14class_mode():
+        if csv_mode_enabled():
+            run_name = f"{run_name}_csv"
+        elif should_use_14class_mode():
             run_name = f"{run_name}_14class"
         if QUICK_CHECK_MODE:
             run_name = f"{run_name}_quickcheck"
@@ -964,10 +1775,13 @@ def main():
         row = {
             "preprocess_name": name,
             "remote_path": remote_path,
-            "class_mode": CLASS_MODE,
+            "label_source": "csv" if csv_mode_enabled() else "dataset",
+            "label_csv": LABEL_CSV if csv_mode_enabled() else "",
+            "class_mode": "csv" if csv_mode_enabled() else CLASS_MODE,
             "source_dataset_root": str(source_dataset_root),
             "dataset_root": str(dataset_root),
-            "base_data_yaml": str(base_data_yaml),
+            "runtime_dataset_root": str(runtime_dataset_root),
+            "base_data_yaml": str(base_data_yaml) if base_data_yaml else "",
             "runtime_yaml": str(runtime_yaml),
             "run_name": run_name,
             "run_dir": str(RUNS_ROOT / run_name),
@@ -976,6 +1790,8 @@ def main():
             "train_images": train_count,
             "val_images": val_count,
             "test_images": test_count,
+            "split_distribution": split_info.get("split_distribution", ""),
+            "runtime_meta": split_info.get("meta", ""),
             "train_epochs": runtime_params["epochs"],
             "train_imgsz": runtime_params["imgsz"],
             "train_batch": runtime_params["batch"],

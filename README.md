@@ -8,8 +8,10 @@ Pipeline hiện tại làm các việc sau:
 - reuse local stage nếu đã có dữ liệu hợp lệ
 - tự unpack `.zip`, `.tar`, `.gz`, `.tgz`
 - sync thêm sidecar non-archive như `annotations/`
+- mặc định đọc label từ `annotations_all_merged_other_1000nf.csv` nếu file này nằm cạnh `train.py`
+- với CSV label mode: bỏ `No finding` khỏi class detection, giữ ảnh đó làm background label rỗng, WBF bbox theo từng ảnh/class, rồi split train/val/test theo `7/1/2`
 - tự convert COCO JSON sang YOLO labels nếu dataset chưa ở format YOLO
-- hỗ trợ 2 mode label:
+- nếu không dùng CSV label mode thì vẫn hỗ trợ 2 mode label cũ:
   - `22` class gốc
   - `14` class official, trong đó 8 class dư sẽ bị loại khỏi runtime dataset
 - tách `val` runtime mới từ `images/train`
@@ -126,7 +128,15 @@ Với COCO/export format, script sẽ tự tạo:
 
 ## 5. Quy Ước Split Runtime
 
-Trong flow hiện tại:
+Trong CSV label mode mặc định:
+
+- CSV đã chứa toàn bộ ảnh cần dùng, bao gồm 1000 ảnh `No finding`
+- script match ảnh từ dataset đã kéo về
+- split runtime mới là `train/val/test = 7/1/2`
+- split dùng multilabel stratification trên image-level class set
+- ảnh background được stratify dưới tên `No finding`
+
+Trong flow cũ không dùng CSV:
 
 - `images/train` gốc được xem là train pool
 - `images/val` gốc được xem là test thật
@@ -142,6 +152,41 @@ Script sinh ra:
 Seed tách split hiện tại là `42`.
 
 ## 6. Biến Môi Trường Quan Trọng
+
+### CSV label mode
+
+Mặc định nếu có file sau thì `train.py` sẽ dùng file này làm label:
+
+```text
+annotations_all_merged_other_1000nf.csv
+```
+
+CSV cần có các cột:
+
+```text
+image_id,class_name,x_min,y_min,x_max,y_max,original_split,image_width,image_height
+```
+
+Trong mode này:
+
+- `No finding` không là class YOLO, ảnh đó vẫn được train như background với label rỗng
+- class list lấy trực tiếp từ CSV sau khi bỏ `No finding`
+- bbox được WBF theo từng `(image_id, class_name)`
+- split runtime là `train/val/test = 7/1/2`
+- runtime dataset nằm dưới `dataset_root/.csv_runtime/`
+- `YOLO_CLASS_MODE` không còn tác dụng trong nhánh CSV này
+
+Nếu muốn dùng CSV khác:
+
+```bash
+export YOLO_LABEL_CSV=/path/to/labels.csv
+```
+
+Nếu muốn tắt CSV label mode và quay lại flow label từ dataset cũ, đổi tên/xóa file CSV mặc định hoặc set `YOLO_LABEL_CSV` rỗng trong shell đang chạy:
+
+```bash
+export YOLO_LABEL_CSV=
+```
 
 ### Class mode
 
@@ -225,7 +270,6 @@ Quick check 1 job:
 ```bash
 cd /home/Ubuntu/LUNG_YOLO_CODE
 source .venv/bin/activate
-export YOLO_CLASS_MODE=22
 export YOLO_QUICK_CHECK=1
 python train.py
 ```
@@ -250,7 +294,6 @@ Lưu ý:
 Quick check nhiều job liên tiếp:
 
 ```bash
-export YOLO_CLASS_MODE=22
 export YOLO_QUICK_CHECK=1
 export YOLO_QUICK_CHECK_JOB_LIMIT=3
 export YOLO_QUICK_CHECK_TRAIN_SAMPLES=128
@@ -263,7 +306,6 @@ python train.py 2>&1 | tee multi_quickcheck.log
 Quick check toàn bộ danh sách nhưng vẫn nhẹ:
 
 ```bash
-export YOLO_CLASS_MODE=22
 export YOLO_QUICK_CHECK=1
 export YOLO_QUICK_CHECK_JOB_LIMIT=9
 export YOLO_QUICK_CHECK_TRAIN_SAMPLES=64
@@ -273,9 +315,10 @@ export YOLO_QUICK_CHECK_EPOCHS=1
 python train.py 2>&1 | tee all_jobs_smoke.log
 ```
 
-Quick check 14 class:
+Quick check 14 class cũ, chỉ dùng khi đã tắt CSV label mode:
 
 ```bash
+export YOLO_LABEL_CSV=
 export YOLO_CLASS_MODE=14
 export YOLO_QUICK_CHECK=1
 python train.py 2>&1 | tee quickcheck_14class.log
@@ -283,13 +326,30 @@ python train.py 2>&1 | tee quickcheck_14class.log
 
 ## 9. Chạy Full
 
-Chạy full:
+Chạy full CSV label mode mặc định:
 
 ```bash
 cd /home/Ubuntu/LUNG_YOLO_CODE
 source .venv/bin/activate
-export YOLO_CLASS_MODE=22
 python train.py
+```
+
+Chạy full CSV label mode và giữ local stage để debug:
+
+```bash
+cd /home/Ubuntu/LUNG_YOLO_CODE
+source .venv/bin/activate
+YOLO_KEEP_STAGE=1 python train.py 2>&1 | tee full_train_csv.log
+```
+
+Các lệnh dưới đây chỉ dành cho flow cũ khi đã tắt CSV label mode.
+
+Chạy full 22 class từ label dataset cũ:
+
+```bash
+cd /home/Ubuntu/LUNG_YOLO_CODE
+source .venv/bin/activate
+YOLO_LABEL_CSV= YOLO_CLASS_MODE=22 python train.py
 ```
 
 Chạy full 14 class:
@@ -297,8 +357,7 @@ Chạy full 14 class:
 ```bash
 cd /home/Ubuntu/LUNG_YOLO_CODE
 source .venv/bin/activate
-export YOLO_CLASS_MODE=14
-python train.py
+YOLO_LABEL_CSV= YOLO_CLASS_MODE=14 python train.py
 ```
 
 Lưu ý với mode 14 class:
@@ -312,13 +371,13 @@ Lưu ý với mode 14 class:
 Chạy full sạch từ đầu:
 
 ```bash
-YOLO_CLASS_MODE=22 YOLO_FORCE_RECOPY=1 YOLO_FORCE_REUNPACK=1 YOLO_KEEP_STAGE=1 python train.py
+YOLO_FORCE_RECOPY=1 YOLO_FORCE_REUNPACK=1 YOLO_KEEP_STAGE=1 python train.py
 ```
 
 Chạy full sạch từ đầu cho 14 class:
 
 ```bash
-YOLO_CLASS_MODE=14 YOLO_FORCE_RECOPY=1 YOLO_FORCE_REUNPACK=1 YOLO_KEEP_STAGE=1 python train.py
+YOLO_LABEL_CSV= YOLO_CLASS_MODE=14 YOLO_FORCE_RECOPY=1 YOLO_FORCE_REUNPACK=1 YOLO_KEEP_STAGE=1 python train.py
 ```
 
 Nếu muốn vừa chạy sạch vừa lưu log:
@@ -326,7 +385,7 @@ Nếu muốn vừa chạy sạch vừa lưu log:
 ```bash
 cd /home/Ubuntu/LUNG_YOLO_CODE
 source .venv/bin/activate
-YOLO_CLASS_MODE=14 YOLO_FORCE_RECOPY=1 YOLO_FORCE_REUNPACK=1 YOLO_KEEP_STAGE=1 python train.py 2>&1 | tee full_train_14class_clean.log
+YOLO_LABEL_CSV= YOLO_CLASS_MODE=14 YOLO_FORCE_RECOPY=1 YOLO_FORCE_REUNPACK=1 YOLO_KEEP_STAGE=1 python train.py 2>&1 | tee full_train_14class_clean.log
 ```
 
 Giải thích:
@@ -344,47 +403,49 @@ sudo apt update
 sudo apt install -y tmux
 ```
 
-Chạy full nền và ghi log:
+Chạy full CSV label mode mặc định trong nền và ghi log:
 
 ```bash
-tmux new -d -s yolo_full 'cd /home/Ubuntu/LUNG_YOLO_CODE && source .venv/bin/activate && YOLO_CLASS_MODE=22 python train.py 2>&1 | tee full_train.log'
+tmux new -d -s yolo_csv 'cd /home/Ubuntu/LUNG_YOLO_CODE && source .venv/bin/activate && python train.py 2>&1 | tee full_train_csv.log'
 ```
 
-Chạy full 14 class trong `tmux`:
+Chạy full CSV label mode nhưng giữ local stage:
 
 ```bash
-tmux new -d -s yolo_full_14 'cd /home/Ubuntu/LUNG_YOLO_CODE && source .venv/bin/activate && YOLO_CLASS_MODE=14 python train.py 2>&1 | tee full_train_14class.log'
+tmux new -d -s yolo_csv_keep 'cd /home/Ubuntu/LUNG_YOLO_CODE && source .venv/bin/activate && YOLO_KEEP_STAGE=1 python train.py 2>&1 | tee full_train_csv_keep.log'
 ```
 
-Chạy full nhưng giữ local stage:
+Chạy full CSV label mode sạch từ đầu:
 
 ```bash
-tmux new -d -s yolo_full_keep 'cd /home/Ubuntu/LUNG_YOLO_CODE && source .venv/bin/activate && YOLO_CLASS_MODE=22 YOLO_KEEP_STAGE=1 python train.py 2>&1 | tee full_train_keep.log'
+tmux new -d -s yolo_csv_clean 'cd /home/Ubuntu/LUNG_YOLO_CODE && source .venv/bin/activate && YOLO_FORCE_RECOPY=1 YOLO_FORCE_REUNPACK=1 YOLO_KEEP_STAGE=1 python train.py 2>&1 | tee full_train_csv_clean.log'
 ```
 
-Chạy full sạch từ đầu:
+Chạy quick check CSV label mode trong `tmux`:
 
 ```bash
-tmux new -d -s yolo_full_clean 'cd /home/Ubuntu/LUNG_YOLO_CODE && source .venv/bin/activate && YOLO_CLASS_MODE=22 YOLO_FORCE_RECOPY=1 YOLO_FORCE_REUNPACK=1 YOLO_KEEP_STAGE=1 python train.py 2>&1 | tee full_train_clean.log'
+tmux new -d -s yolo_csv_quick 'cd /home/Ubuntu/LUNG_YOLO_CODE && source .venv/bin/activate && YOLO_QUICK_CHECK=1 python train.py 2>&1 | tee quickcheck_csv.log'
 ```
 
-Chạy full sạch từ đầu cho 14 class trong `tmux`:
+Các lệnh dưới đây chỉ dành cho flow cũ khi đã tắt CSV label mode.
+
+Chạy full 22 class cũ trong `tmux`:
 
 ```bash
-tmux new -d -s yolo_full_14_clean 'cd /home/Ubuntu/LUNG_YOLO_CODE && source .venv/bin/activate && YOLO_CLASS_MODE=14 YOLO_FORCE_RECOPY=1 YOLO_FORCE_REUNPACK=1 YOLO_KEEP_STAGE=1 python train.py 2>&1 | tee full_train_14class_clean.log'
+tmux new -d -s yolo_full_22 'cd /home/Ubuntu/LUNG_YOLO_CODE && source .venv/bin/activate && YOLO_LABEL_CSV= YOLO_CLASS_MODE=22 python train.py 2>&1 | tee full_train_22class.log'
 ```
 
-Chạy quick check trong `tmux`:
+Chạy full 14 class cũ trong `tmux`:
 
 ```bash
-tmux new -d -s yolo_quickcheck 'cd /home/Ubuntu/LUNG_YOLO_CODE && source .venv/bin/activate && YOLO_CLASS_MODE=22 YOLO_QUICK_CHECK=1 python train.py 2>&1 | tee quickcheck.log'
+tmux new -d -s yolo_full_14 'cd /home/Ubuntu/LUNG_YOLO_CODE && source .venv/bin/activate && YOLO_LABEL_CSV= YOLO_CLASS_MODE=14 python train.py 2>&1 | tee full_train_14class.log'
 ```
 
 Lệnh hay dùng:
 
 ```bash
 tmux ls
-tmux attach -t yolo_full
+tmux attach -t yolo_csv
 ```
 
 Detach mà không kill job:
@@ -398,8 +459,8 @@ Detach mà không kill job:
 Nếu chạy với `tee`:
 
 ```bash
-tail -f /home/Ubuntu/LUNG_YOLO_CODE/full_train.log
-tail -f /home/Ubuntu/LUNG_YOLO_CODE/quickcheck.log
+tail -f /home/Ubuntu/LUNG_YOLO_CODE/full_train_csv.log
+tail -f /home/Ubuntu/LUNG_YOLO_CODE/quickcheck_csv.log
 tail -f /home/Ubuntu/LUNG_YOLO_CODE/full_train_14class.log
 ```
 
@@ -451,6 +512,12 @@ Các output chính:
   - `train_args.yaml`
 - `./yolo_preprocess_runner/training_summary.csv`
   - bảng tổng hợp tất cả job đã chạy trong phiên hiện tại
+- nếu chạy CSV label mode, mỗi dataset sẽ có runtime root riêng:
+  - `dataset_root/.csv_runtime/`
+  - `images/` là symlink sang ảnh gốc
+  - `labels/` là label sinh từ CSV sau WBF và split `7/1/2`
+  - `meta.json` lưu thông tin CSV, WBF, split, class list
+  - `split_distribution.csv` lưu phân bố class theo split
 - nếu chạy `YOLO_CLASS_MODE=14`, mỗi dataset sẽ có runtime root riêng:
   - `dataset_root/.yolo_runtime_14class/`
   - đây là dataset tạm đã lọc về đúng 14 class
