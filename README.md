@@ -1,33 +1,17 @@
 # Lung YOLOv8 Training Runner
 
-Repo này dùng [train.py](/home/Ubuntu/LUNG_YOLO_CODE/train.py) để train YOLOv8 lần lượt trên nhiều bộ dữ liệu preprocessing được lưu trên remote `rclone`.
+Repo này dùng `train.py` để train YOLOv8 trên nhiều bộ ảnh preprocessing được lưu trên remote `rclone`.
 
-Pipeline hiện tại làm các việc sau:
+Flow hiện tại là **CSV label mode**:
 
-- copy dataset từ remote về local stage nếu cần
-- reuse local stage nếu đã có dữ liệu hợp lệ
-- tự unpack `.zip`, `.tar`, `.gz`, `.tgz`
-- sync thêm sidecar non-archive như `annotations/`
-- mặc định đọc label từ `annotations_all_merged_other_1000nf.csv` nếu file này nằm cạnh `train.py`
-- với CSV label mode: bỏ `No finding` khỏi class detection, giữ ảnh đó làm background label rỗng, WBF bbox theo từng ảnh/class, rồi split train/val/test theo `7/1/2`
-- tự convert COCO JSON sang YOLO labels nếu dataset chưa ở format YOLO
-- nếu không dùng CSV label mode thì vẫn hỗ trợ 2 mode label cũ:
-  - `22` class gốc
-  - `14` class official, trong đó 8 class dư sẽ bị loại khỏi runtime dataset
-- tách `val` runtime mới từ `images/train`
-- dùng `images/val` cũ làm `test`
-- train YOLOv8
-- eval trên `val` và `test`
-- lưu weights, metrics và bảng tổng hợp
+- ảnh vẫn được kéo từ rclone như trước
+- label đọc từ `annotations_all_merged_other_1000nf.csv`
+- `No finding` được giữ làm ảnh background với label rỗng
+- bbox abnormal được WBF theo từng `(image_id, class_name)`
+- split lại `train/val/test = 7/1/2`
+- train từng preprocessing job và lưu metrics/weights
 
-## 1. Yêu Cầu
-
-- Ubuntu/Linux
-- Python 3.10+
-- GPU CUDA nếu muốn train nhanh
-- `rclone` đã config remote
-
-## 2. Cài Đặt
+## 1. Setup
 
 ```bash
 cd /home/Ubuntu/LUNG_YOLO_CODE
@@ -37,49 +21,11 @@ pip install -U pip
 pip install -r requirements.txt
 ```
 
-Nếu máy thiếu `venv`:
-
-```bash
-sudo apt install python3.10-venv
-```
-
-Cài `rclone`:
-
-```bash
-curl https://rclone.org/install.sh | sudo bash
-```
-
-Kiểm tra remote:
+Cần có `rclone` và remote đã config:
 
 ```bash
 rclone listremotes
 ```
-
-## 3. Các Dataset Đang Chạy
-
-Mặc định [train.py](/home/Ubuntu/LUNG_YOLO_CODE/train.py) loop qua:
-
-- `vinbigdata-CLAHE-png`
-- `vinbigdata-HistogramEq-png`
-- `vinbigdata-adaptive-preprocessed`
-- `vinbigdata-percentile-png`
-- `vinbigdata-raw_minmax-png`
-- `vinbigdata-rescale_minmax-png`
-- `vindr_yolo_dataset`
-- `vinbigdata-lut-png`
-- `vinbigdata-expert-png`
-
-Tên job local tương ứng:
-
-- `clahe`
-- `histogram_eq`
-- `adaptive_preprocessed`
-- `percentile`
-- `raw_minmax`
-- `rescale_minmax`
-- `base_dataset`
-- `LUT`
-- `expert_window`
 
 Remote base mặc định:
 
@@ -87,75 +33,15 @@ Remote base mặc định:
 RCLONE_REMOTE_BASE="rclone:"
 ```
 
-Nếu remote thật nằm trong một thư mục cha khác:
+Nếu dataset nằm trong folder con:
 
 ```bash
 export RCLONE_REMOTE_BASE='rclone:some_parent/'
 ```
 
-## 4. Format Dataset Được Hỗ Trợ
+## 2. File Label
 
-### YOLO format
-
-```text
-dataset_root/
-  data.yaml
-  images/
-    train/
-    val/
-  labels/
-    train/
-    val/
-```
-
-### COCO/export format
-
-```text
-dataset_root/
-  images/
-    train/
-    val/
-  annotations/
-    instances_train.json
-    instances_val.json
-```
-
-Với COCO/export format, script sẽ tự tạo:
-
-- `labels/train/*.txt`
-- `labels/val/*.txt`
-- `data.yaml`
-
-## 5. Quy Ước Split Runtime
-
-Trong CSV label mode mặc định:
-
-- CSV đã chứa toàn bộ ảnh cần dùng, bao gồm 1000 ảnh `No finding`
-- script match ảnh từ dataset đã kéo về
-- split runtime mới là `train/val/test = 7/1/2`
-- split dùng multilabel stratification trên image-level class set
-- ảnh background được stratify dưới tên `No finding`
-
-Trong flow cũ không dùng CSV:
-
-- `images/train` gốc được xem là train pool
-- `images/val` gốc được xem là test thật
-- `val` runtime mới được random tách từ `images/train`
-
-Script sinh ra:
-
-- `train.runtime.txt`
-- `val.runtime.txt`
-- `test.runtime.txt` nếu có test
-- `data.runtime.yaml`
-
-Seed tách split hiện tại là `42`.
-
-## 6. Biến Môi Trường Quan Trọng
-
-### CSV label mode
-
-Mặc định nếu có file sau thì `train.py` sẽ dùng file này làm label:
+Mặc định `train.py` tự dùng file nằm cạnh nó:
 
 ```text
 annotations_all_merged_other_1000nf.csv
@@ -164,17 +50,17 @@ annotations_all_merged_other_1000nf.csv
 CSV cần có các cột:
 
 ```text
-image_id,class_name,x_min,y_min,x_max,y_max,original_split,image_width,image_height
+image_id,rad_id,class_name,x_min,y_min,x_max,y_max,original_split,image_width,image_height
 ```
 
-Trong mode này:
+Ý nghĩa chính:
 
-- `No finding` không là class YOLO, ảnh đó vẫn được train như background với label rỗng
-- class list lấy trực tiếp từ CSV sau khi bỏ `No finding`
-- bbox được WBF theo từng `(image_id, class_name)`
-- split runtime là `train/val/test = 7/1/2`
-- runtime dataset nằm dưới `dataset_root/.csv_runtime/`
-- `YOLO_CLASS_MODE` không còn tác dụng trong nhánh CSV này
+- `image_id`: dùng để match ảnh trong dataset rclone
+- `class_name`: tên class
+- `No finding`: không train thành class YOLO, chỉ tạo label rỗng
+- `x_min,y_min,x_max,y_max`: bbox pixel theo ảnh gốc
+- `image_width,image_height`: size ảnh gốc để normalize bbox đúng
+- `original_split`: ưu tiên match ảnh trong folder nguồn tương ứng
 
 Nếu muốn dùng CSV khác:
 
@@ -182,266 +68,85 @@ Nếu muốn dùng CSV khác:
 export YOLO_LABEL_CSV=/path/to/labels.csv
 ```
 
-Nếu muốn tắt CSV label mode và quay lại flow label từ dataset cũ, đổi tên/xóa file CSV mặc định hoặc set `YOLO_LABEL_CSV` rỗng trong shell đang chạy:
+## 3. Dataset Jobs
 
-```bash
-export YOLO_LABEL_CSV=
+Mặc định script chạy lần lượt:
+
+```text
+clahe
+histogram_eq
+adaptive_preprocessed
+percentile
+raw_minmax
+rescale_minmax
+base_dataset
+LUT
+expert_window
 ```
 
-### Class mode
+Mỗi job sẽ:
 
-- `YOLO_CLASS_MODE=22`
-  - train theo full 22 class gốc
-- `YOLO_CLASS_MODE=14`
-  - train theo 14 class official
-  - script dựng runtime dataset riêng dưới `dataset_root/.yolo_runtime_14class/`
-  - giữ đúng 14 class sau:
-    - `Aortic enlargement`
-    - `Atelectasis`
-    - `Calcification`
-    - `Cardiomegaly`
-    - `Consolidation`
-    - `ILD`
-    - `Infiltration`
-    - `Lung Opacity`
-    - `Nodule/Mass`
-    - `Other lesion`
-    - `Pleural effusion`
-    - `Pleural thickening`
-    - `Pneumothorax`
-    - `Pulmonary fibrosis`
-  - bỏ 8 class dư:
-    - `Clavicle fracture`
-    - `Edema`
-    - `Emphysema`
-    - `Enlarged PA`
-    - `Lung cavity`
-    - `Lung cyst`
-    - `Mediastinal shift`
-    - `Rib fracture`
+1. copy/reuse/unpack dataset từ rclone
+2. đọc CSV label
+3. WBF bbox
+4. split train/val/test `7/1/2`
+5. tạo runtime dataset `.csv_runtime`
+6. train YOLO
+7. eval `val` và `test`
+8. lưu weights/metrics
+9. dọn local ảnh nếu `YOLO_KEEP_STAGE=0`
 
-### Quick check
+## 4. Chạy Bằng tmux
 
-- `YOLO_QUICK_CHECK=1`
-- `YOLO_QUICK_CHECK_JOB_LIMIT`
-- `YOLO_QUICK_CHECK_TRAIN_SAMPLES`
-- `YOLO_QUICK_CHECK_VAL_SAMPLES`
-- `YOLO_QUICK_CHECK_TEST_SAMPLES`
-- `YOLO_QUICK_CHECK_EPOCHS`
-- `YOLO_QUICK_CHECK_IMGSZ`
-- `YOLO_QUICK_CHECK_BATCH`
+Workflow khuyến nghị: chạy quick check trước, nếu ổn thì chạy full.
 
-### Recovery và local stage
+### Bước 1: Quick Check
 
-- `YOLO_FORCE_RECOPY=1`
-  - xóa local stage của job rồi copy lại từ remote
-- `YOLO_FORCE_REUNPACK=1`
-  - ép unpack lại từ đầu
-- `YOLO_KEEP_STAGE=1`
-  - giữ `downloads/` và `extracted/` sau mỗi job để debug
-
-### Work root
-
-- `YOLO_WORK_ROOT=/path/to/workdir`
-
-Mặc định:
-
-```bash
-YOLO_WORK_ROOT=./yolo_preprocess_runner
-```
-
-## 7. Tham Số Train Mặc Định
-
-Các tham số đang hard-code trong [train.py](/home/Ubuntu/LUNG_YOLO_CODE/train.py):
-
-- `MODEL_NAME="yolov8n.pt"`
-- `EPOCHS=50`
-- `IMG_SIZE=1024`
-- `BATCH=8`
-- `WORKERS=4`
-- `VAL_SIZE=3000`
-
-Muốn đổi thì sửa trực tiếp file.
-
-## 8. Chạy Quick Check
-
-Quick check 1 job:
-
-```bash
-cd /home/Ubuntu/LUNG_YOLO_CODE
-source .venv/bin/activate
-export YOLO_QUICK_CHECK=1
-python train.py
-```
-
-Quick check mặc định:
-
-- 1 job đầu
-- 128 ảnh train
-- 32 ảnh val
-- 32 ảnh test
-- 1 epoch
-- `imgsz=640`
-- `batch=4`
-
-Lưu ý:
-
-- nếu log in ra `Image sizes 640 train, 640 val` thì đó là do đang chạy quick check
-- không phải dataset bị resize permanent
-- muốn dùng size full theo config chính thì tắt quick check hoặc set:
-  - `YOLO_QUICK_CHECK_IMGSZ=1024`
-
-Quick check nhiều job liên tiếp:
-
-```bash
-export YOLO_QUICK_CHECK=1
-export YOLO_QUICK_CHECK_JOB_LIMIT=3
-export YOLO_QUICK_CHECK_TRAIN_SAMPLES=128
-export YOLO_QUICK_CHECK_VAL_SAMPLES=32
-export YOLO_QUICK_CHECK_TEST_SAMPLES=32
-export YOLO_QUICK_CHECK_EPOCHS=1
-python train.py 2>&1 | tee multi_quickcheck.log
-```
-
-Quick check toàn bộ danh sách nhưng vẫn nhẹ:
-
-```bash
-export YOLO_QUICK_CHECK=1
-export YOLO_QUICK_CHECK_JOB_LIMIT=9
-export YOLO_QUICK_CHECK_TRAIN_SAMPLES=64
-export YOLO_QUICK_CHECK_VAL_SAMPLES=16
-export YOLO_QUICK_CHECK_TEST_SAMPLES=16
-export YOLO_QUICK_CHECK_EPOCHS=1
-python train.py 2>&1 | tee all_jobs_smoke.log
-```
-
-Quick check 14 class cũ, chỉ dùng khi đã tắt CSV label mode:
-
-```bash
-export YOLO_LABEL_CSV=
-export YOLO_CLASS_MODE=14
-export YOLO_QUICK_CHECK=1
-python train.py 2>&1 | tee quickcheck_14class.log
-```
-
-## 9. Chạy Full
-
-Chạy full CSV label mode mặc định:
-
-```bash
-cd /home/Ubuntu/LUNG_YOLO_CODE
-source .venv/bin/activate
-python train.py
-```
-
-Chạy full CSV label mode và giữ local stage để debug:
-
-```bash
-cd /home/Ubuntu/LUNG_YOLO_CODE
-source .venv/bin/activate
-YOLO_KEEP_STAGE=1 python train.py 2>&1 | tee full_train_csv.log
-```
-
-Các lệnh dưới đây chỉ dành cho flow cũ khi đã tắt CSV label mode.
-
-Chạy full 22 class từ label dataset cũ:
-
-```bash
-cd /home/Ubuntu/LUNG_YOLO_CODE
-source .venv/bin/activate
-YOLO_LABEL_CSV= YOLO_CLASS_MODE=22 python train.py
-```
-
-Chạy full 14 class:
-
-```bash
-cd /home/Ubuntu/LUNG_YOLO_CODE
-source .venv/bin/activate
-YOLO_LABEL_CSV= YOLO_CLASS_MODE=14 python train.py
-```
-
-Lưu ý với mode 14 class:
-
-- script tạo runtime dataset tạm dưới:
-  - `dataset_root/.yolo_runtime_14class/`
-- ảnh được symlink từ dataset gốc
-- label được tạo mới theo đúng 14 class official
-- dataset gốc 22-class không bị sửa
-
-Chạy full sạch từ đầu:
-
-```bash
-YOLO_FORCE_RECOPY=1 YOLO_FORCE_REUNPACK=1 YOLO_KEEP_STAGE=1 python train.py
-```
-
-Chạy full sạch từ đầu cho 14 class:
-
-```bash
-YOLO_LABEL_CSV= YOLO_CLASS_MODE=14 YOLO_FORCE_RECOPY=1 YOLO_FORCE_REUNPACK=1 YOLO_KEEP_STAGE=1 python train.py
-```
-
-Nếu muốn vừa chạy sạch vừa lưu log:
-
-```bash
-cd /home/Ubuntu/LUNG_YOLO_CODE
-source .venv/bin/activate
-YOLO_LABEL_CSV= YOLO_CLASS_MODE=14 YOLO_FORCE_RECOPY=1 YOLO_FORCE_REUNPACK=1 YOLO_KEEP_STAGE=1 python train.py 2>&1 | tee full_train_14class_clean.log
-```
-
-Giải thích:
-
-- `FORCE_RECOPY` để copy lại dữ liệu từ remote
-- `FORCE_REUNPACK` để unpack lại local stage
-- `KEEP_STAGE` để giữ dữ liệu local nếu cần debug
-
-## 10. Chạy Trong tmux
-
-Cài `tmux` nếu chưa có:
-
-```bash
-sudo apt update
-sudo apt install -y tmux
-```
-
-Chạy full CSV label mode mặc định trong nền và ghi log:
-
-```bash
-tmux new -d -s yolo_csv 'cd /home/Ubuntu/LUNG_YOLO_CODE && source .venv/bin/activate && python train.py 2>&1 | tee full_train_csv.log'
-```
-
-Chạy full CSV label mode nhưng giữ local stage:
-
-```bash
-tmux new -d -s yolo_csv_keep 'cd /home/Ubuntu/LUNG_YOLO_CODE && source .venv/bin/activate && YOLO_KEEP_STAGE=1 python train.py 2>&1 | tee full_train_csv_keep.log'
-```
-
-Chạy full CSV label mode sạch từ đầu:
-
-```bash
-tmux new -d -s yolo_csv_clean 'cd /home/Ubuntu/LUNG_YOLO_CODE && source .venv/bin/activate && YOLO_FORCE_RECOPY=1 YOLO_FORCE_REUNPACK=1 YOLO_KEEP_STAGE=1 python train.py 2>&1 | tee full_train_csv_clean.log'
-```
-
-Chạy quick check CSV label mode trong `tmux`:
+Quick check chạy 1 job, ít ảnh, 1 epoch để bắt lỗi CSV, rclone, split, label, train loop.
 
 ```bash
 tmux new -d -s yolo_csv_quick 'cd /home/Ubuntu/LUNG_YOLO_CODE && source .venv/bin/activate && YOLO_QUICK_CHECK=1 python train.py 2>&1 | tee quickcheck_csv.log'
 ```
 
-Các lệnh dưới đây chỉ dành cho flow cũ khi đã tắt CSV label mode.
-
-Chạy full 22 class cũ trong `tmux`:
+Theo dõi:
 
 ```bash
-tmux new -d -s yolo_full_22 'cd /home/Ubuntu/LUNG_YOLO_CODE && source .venv/bin/activate && YOLO_LABEL_CSV= YOLO_CLASS_MODE=22 python train.py 2>&1 | tee full_train_22class.log'
+tmux attach -t yolo_csv_quick
+tail -f /home/Ubuntu/LUNG_YOLO_CODE/quickcheck_csv.log
 ```
 
-Chạy full 14 class cũ trong `tmux`:
+Nếu quick check xong không có traceback/error và có `CURRENT SUMMARY`, chuyển sang full run.
+
+### Bước 2: Full Run
+
+Full run mặc định **có dọn ảnh sau mỗi job** vì không set `YOLO_KEEP_STAGE=1`.
 
 ```bash
-tmux new -d -s yolo_full_14 'cd /home/Ubuntu/LUNG_YOLO_CODE && source .venv/bin/activate && YOLO_LABEL_CSV= YOLO_CLASS_MODE=14 python train.py 2>&1 | tee full_train_14class.log'
+tmux new -d -s yolo_csv 'cd /home/Ubuntu/LUNG_YOLO_CODE && source .venv/bin/activate && YOLO_QUICK_CHECK=0 python train.py 2>&1 | tee full_train_csv.log'
 ```
 
-Lệnh hay dùng:
+Theo dõi:
+
+```bash
+tmux attach -t yolo_csv
+tail -f /home/Ubuntu/LUNG_YOLO_CODE/full_train_csv.log
+```
+
+### Các Lệnh Khác
+
+Nếu muốn giữ ảnh local để debug:
+
+```bash
+tmux new -d -s yolo_csv_keep 'cd /home/Ubuntu/LUNG_YOLO_CODE && source .venv/bin/activate && YOLO_KEEP_STAGE=1 python train.py 2>&1 | tee full_train_csv_keep.log'
+```
+
+Nếu muốn kéo/unpack sạch lại từ đầu:
+
+```bash
+tmux new -d -s yolo_csv_clean 'cd /home/Ubuntu/LUNG_YOLO_CODE && source .venv/bin/activate && YOLO_FORCE_RECOPY=1 YOLO_FORCE_REUNPACK=1 python train.py 2>&1 | tee full_train_csv_clean.log'
+```
+
+Theo dõi tmux:
 
 ```bash
 tmux ls
@@ -450,30 +155,20 @@ tmux attach -t yolo_csv
 
 Detach mà không kill job:
 
-- nhấn `Ctrl+b`
-- thả ra
-- nhấn `d`
+```text
+Ctrl+b rồi nhấn d
+```
 
-## 11. Check Log Và Process
-
-Nếu chạy với `tee`:
+## 5. Theo Dõi Log
 
 ```bash
 tail -f /home/Ubuntu/LUNG_YOLO_CODE/full_train_csv.log
-tail -f /home/Ubuntu/LUNG_YOLO_CODE/quickcheck_csv.log
-tail -f /home/Ubuntu/LUNG_YOLO_CODE/full_train_14class.log
-```
-
-Xem 100 dòng cuối:
-
-```bash
-tail -n 100 /home/Ubuntu/LUNG_YOLO_CODE/full_train.log
 ```
 
 Tìm lỗi nhanh:
 
 ```bash
-grep -i "traceback\\|error\\|failed" /home/Ubuntu/LUNG_YOLO_CODE/full_train.log
+grep -i "traceback\|error\|failed" /home/Ubuntu/LUNG_YOLO_CODE/full_train_csv.log
 ```
 
 Check process:
@@ -482,131 +177,190 @@ Check process:
 ps -ef | grep 'python train.py' | grep -v grep
 ```
 
-Dấu hiệu job đang chạy bình thường:
+Dấu hiệu chạy bình thường:
 
-- còn thấy session trong `tmux ls`
+- còn session trong `tmux ls`
 - log vẫn ra dòng mới
 - có `START JOB: ...`
+- có `Built CSV runtime dataset: ...`
 - có `BEST_WEIGHT: ...`
 - có `CURRENT SUMMARY`
 
-## 12. Output Được Lưu Ở Đâu
+Sau quick check nên kiểm tra nhanh:
+
+```bash
+grep -i "traceback\|error\|failed" /home/Ubuntu/LUNG_YOLO_CODE/quickcheck_csv.log
+```
+
+## 6. Output
 
 Work root mặc định:
 
-```bash
+```text
 ./yolo_preprocess_runner
 ```
 
-Các output chính:
+Output chính:
 
-- `./yolo_preprocess_runner/runs/`
-  - output gốc của Ultralytics
-- `./yolo_preprocess_runner/results/<job_name>/`
-  - `best.pt`
-  - `last.pt`
-  - `data.runtime.yaml`
-  - `metrics.json`
-  - `metrics.csv`
-  - `train_results.csv`
-  - `train_args.yaml`
-- `./yolo_preprocess_runner/training_summary.csv`
-  - bảng tổng hợp tất cả job đã chạy trong phiên hiện tại
-- nếu chạy CSV label mode, mỗi dataset sẽ có runtime root riêng:
-  - `dataset_root/.csv_runtime/`
-  - `images/` là symlink sang ảnh gốc
-  - `labels/` là label sinh từ CSV sau WBF và split `7/1/2`
-  - `meta.json` lưu thông tin CSV, WBF, split, class list
-  - `split_distribution.csv` lưu phân bố class theo split
-- nếu chạy `YOLO_CLASS_MODE=14`, mỗi dataset sẽ có runtime root riêng:
-  - `dataset_root/.yolo_runtime_14class/`
-  - đây là dataset tạm đã lọc về đúng 14 class
-  - `images/` là symlink sang ảnh gốc
-  - `labels/` là label 14-class mới được sinh ra
+```text
+yolo_preprocess_runner/runs/
+yolo_preprocess_runner/results/<job_name>/
+yolo_preprocess_runner/training_summary.csv
+```
 
-## 13. Sau Khi Chạy Xong Nó Xóa Gì
+Trong `results/<job_name>/`:
 
-Nếu:
+```text
+best.pt
+last.pt
+data.runtime.yaml
+metrics.json
+metrics.csv
+train_results.csv
+train_args.yaml
+```
+
+Runtime dataset tạm của mỗi job:
+
+```text
+dataset_root/.csv_runtime/
+  images/train/
+  images/val/
+  images/test/
+  labels/train/
+  labels/val/
+  labels/test/
+  data.runtime.yaml
+  meta.json
+  split_distribution.csv
+```
+
+`images/` là symlink sang ảnh đã kéo từ rclone. `labels/` là label YOLO sinh từ CSV sau WBF.
+
+## 7. Dọn Dẹp Disk
+
+Mặc định:
 
 ```bash
 YOLO_KEEP_STAGE=0
 ```
 
-thì sau mỗi job script sẽ xóa:
+Sau mỗi job script sẽ xóa:
 
-- `WORK_ROOT/downloads`
-- `WORK_ROOT/extracted`
+```text
+yolo_preprocess_runner/downloads/
+yolo_preprocess_runner/extracted/
+```
 
-Nhưng vẫn giữ:
+Vẫn giữ:
 
-- `WORK_ROOT/runs`
-- `WORK_ROOT/results`
-- `WORK_ROOT/training_summary.csv`
+```text
+yolo_preprocess_runner/runs/
+yolo_preprocess_runner/results/
+yolo_preprocess_runner/training_summary.csv
+```
 
-Ngoài ra script chỉ dọn thêm:
-
-- Python GC qua `gc.collect()`
-- CUDA cache qua `torch.cuda.empty_cache()`
-
-Nếu muốn giữ local stage để debug:
+Muốn giữ ảnh local để debug:
 
 ```bash
 export YOLO_KEEP_STAGE=1
 ```
 
-## 14. Flow Reuse Và Recovery Local Stage
-
-Trước khi copy lại từ remote, script sẽ thử theo thứ tự:
-
-1. reuse `extracted/` nếu đã có dataset root
-2. sync sidecar non-archive từ `downloads/` sang `extracted/`
-3. dùng dataset trực tiếp từ `downloads/` nếu đủ cấu trúc
-4. unpack archive từ `downloads/` sang `extracted/`
-5. nếu local không usable thì recopy từ remote
-
-Code hiện tại đã cover các case phổ biến:
-
-- thiếu `annotations`
-- partial unpack
-- remote copy xong nhưng local chưa bung archive
-- COCO `file_name` dạng `images/train/xxx.png`
-
-## 15. Lỗi Thường Gặp
-
-### Thiếu `rclone`
-
-Script sẽ fail sớm nếu máy chưa có `rclone`.
-
-### Thiếu `instances_train.json` hoặc `instances_val.json`
-
-Dataset COCO/export cần đủ:
-
-```text
-annotations/instances_train.json
-annotations/instances_val.json
-```
-
-### Thiếu ảnh được tham chiếu trong COCO JSON
-
-Nếu lỗi kiểu:
-
-```text
-FileNotFoundError: Thiếu ảnh images/train/xxx.png trong ...
-```
-
-thì nghĩa là local stage hoặc remote source đang thiếu file ảnh thật. Khi đó nên chạy sạch:
+## 8. Quick Check Không Dùng tmux
 
 ```bash
-YOLO_FORCE_RECOPY=1 YOLO_FORCE_REUNPACK=1 YOLO_KEEP_STAGE=1 python train.py
+cd /home/Ubuntu/LUNG_YOLO_CODE
+source .venv/bin/activate
+YOLO_QUICK_CHECK=1 python train.py 2>&1 | tee quickcheck_csv.log
 ```
 
-Nếu vẫn lỗi cùng một ảnh sau khi chạy sạch, vấn đề nằm ở source data chứ không phải `tmux`.
+Tùy chỉnh quick check:
 
-## 16. File Chính Trong Repo
+```bash
+export YOLO_QUICK_CHECK=1
+export YOLO_QUICK_CHECK_JOB_LIMIT=1
+export YOLO_QUICK_CHECK_TRAIN_SAMPLES=128
+export YOLO_QUICK_CHECK_VAL_SAMPLES=32
+export YOLO_QUICK_CHECK_TEST_SAMPLES=32
+export YOLO_QUICK_CHECK_EPOCHS=1
+export YOLO_QUICK_CHECK_IMGSZ=640
+export YOLO_QUICK_CHECK_BATCH=4
+python train.py
+```
 
-- [train.py](/home/Ubuntu/LUNG_YOLO_CODE/train.py)
-  - pipeline train chính
-- [requirements.txt](/home/Ubuntu/LUNG_YOLO_CODE/requirements.txt)
-  - dependency runtime
-- [README.md](/home/Ubuntu/LUNG_YOLO_CODE/README.md)
-  - tài liệu sử dụng
+## 9. Biến Môi Trường Hay Dùng
+
+```text
+YOLO_LABEL_CSV=/path/to/labels.csv
+YOLO_WORK_ROOT=/path/to/workdir
+YOLO_QUICK_CHECK=1
+YOLO_QUICK_CHECK_JOB_LIMIT=1
+YOLO_FORCE_RECOPY=1
+YOLO_FORCE_REUNPACK=1
+YOLO_KEEP_STAGE=1
+RCLONE_REMOTE_BASE=rclone:
+YOLO_WBF_IOU_THRESHOLD=0.5
+```
+
+## 10. Legacy Mode
+
+Flow cũ dùng label có sẵn trong dataset và `YOLO_CLASS_MODE=22/14`. Chỉ dùng khi muốn bỏ CSV label mode.
+
+Tắt CSV mode:
+
+```bash
+export YOLO_LABEL_CSV=
+```
+
+Chạy legacy 22 class:
+
+```bash
+YOLO_LABEL_CSV= YOLO_CLASS_MODE=22 python train.py
+```
+
+Chạy legacy 14 class:
+
+```bash
+YOLO_LABEL_CSV= YOLO_CLASS_MODE=14 python train.py
+```
+
+Trong CSV label mode hiện tại, `YOLO_CLASS_MODE` không có tác dụng.
+
+## 11. Lỗi Thường Gặp
+
+Thiếu `rclone`:
+
+```text
+Thiếu lệnh 'rclone'
+```
+
+Kiểm tra/cài lại `rclone`, sau đó chạy lại.
+
+Thiếu ảnh từ remote:
+
+```text
+CSV missing images: ...
+```
+
+Kiểm tra remote dataset có đủ ảnh chưa. Nếu local stage cũ bị lỗi, chạy sạch:
+
+```bash
+YOLO_FORCE_RECOPY=1 YOLO_FORCE_REUNPACK=1 python train.py
+```
+
+CSV thiếu cột:
+
+```text
+CSV thiếu cột bắt buộc
+```
+
+Kiểm tra lại header CSV, đặc biệt `image_width,image_height`.
+
+## 12. File Chính
+
+```text
+train.py
+requirements.txt
+annotations_all_merged_other_1000nf.csv
+README.md
+```
